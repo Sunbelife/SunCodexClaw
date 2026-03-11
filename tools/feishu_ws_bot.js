@@ -1217,26 +1217,35 @@ function detectBotOpenIdCandidate(mentions = [], mentionAliases = []) {
   return matched.find((item) => item.openId === uniqueMatches[0]) || null;
 }
 
-function autoDetectAndPersistBotOpenId({ accountName, creds, mentions = [], mentionAliases = [] }) {
-  if (String(creds?.botOpenId?.value || '').trim()) return '';
-
+function reconcileBotOpenIdFromMentions({ accountName, creds, mentions = [], mentionAliases = [] }) {
   const candidate = detectBotOpenIdCandidate(mentions, mentionAliases);
-  if (!candidate) return '';
+  if (!candidate) return null;
 
   const targetAccount = String(accountName || 'default').trim() || 'default';
+  const current = String(creds?.botOpenId?.value || '').trim();
+  const needsPersist = current !== candidate.openId;
+  const action = current ? 'reconciled' : 'auto_detected';
+
+  if (creds?.botOpenId) {
+    creds.botOpenId.value = candidate.openId;
+    creds.botOpenId.source = current === candidate.openId
+      ? (creds.botOpenId.source || 'config')
+      : `runtime:${action}`;
+  }
+  if (!needsPersist) return candidate;
+
   try {
     const saved = upsertConfigEntry('feishu', targetAccount, {
       bot_open_id: candidate.openId,
     });
-    creds.botOpenId.value = candidate.openId;
-    creds.botOpenId.source = 'config:auto-detected';
+    if (creds?.botOpenId) creds.botOpenId.source = `config:${action}`;
     console.log(
-      `bot_open_id_auto_detected=ok account=${targetAccount} name=${candidate.name || '(unknown)'} file=${saved.filePath}`
+      `bot_open_id_${action}=ok account=${targetAccount} name=${candidate.name || '(unknown)'} file=${saved.filePath}`
     );
-    return candidate.openId;
+    return candidate;
   } catch (err) {
-    console.error(`bot_open_id_auto_detected=error account=${targetAccount} message=${err.message}`);
-    return '';
+    console.error(`bot_open_id_${action}=error account=${targetAccount} message=${err.message}`);
+    return candidate;
   }
 }
 
@@ -2032,8 +2041,131 @@ function handleThreadCommand(state, command) {
   return { handled: false, reply: '' };
 }
 
-function buildCodexPrompt({ systemPrompt, history, userText, imageCount = 0, cwd = '', addDirs = [] }) {
+function buildCodexThreadTitle({ botName = '', localThreadName = '', userText = '' }) {
+  const botLabel = compactText(String(botName || '飞书机器人').replace(/\s+/g, ' '), 24);
+  const threadLabel = compactText(String(localThreadName || '主线程').replace(/\s+/g, ' '), 18);
+  const userLabel = compactText(String(userText || '').replace(/\s+/g, ' '), 42);
+  return [botLabel, threadLabel, userLabel].filter(Boolean).join(' | ');
+}
+
+let cachedCodexStateDbPath = '';
+
+function resolveCodexStateDbPath() {
+  if (cachedCodexStateDbPath && fs.existsSync(cachedCodexStateDbPath)) {
+    return cachedCodexStateDbPath;
+  }
+  const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+  let candidates = [];
+  try {
+    candidates = fs.readdirSync(codexHome)
+      .filter((name) => /^state_\d+\.sqlite$/.test(name))
+      .map((name) => path.join(codexHome, name))
+      .filter((fullPath) => fs.existsSync(fullPath));
+  } catch (_) {
+    candidates = [];
+  }
+  if (candidates.length === 0) return '';
+  candidates.sort((a, b) => {
+    try {
+      return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+    } catch (_) {
+      return 0;
+    }
+  });
+  cachedCodexStateDbPath = candidates[0] || '';
+  return cachedCodexStateDbPath;
+}
+
+function quoteSqliteString(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`;
+}
+
+function syncCodexThreadTitle(threadId, threadTitle) {
+  const targetThreadId = String(threadId || '').trim();
+  const nextTitle = String(threadTitle || '').trim();
+  if (!targetThreadId || !nextTitle) return false;
+
+  const dbPath = resolveCodexStateDbPath();
+  if (!dbPath) return false;
+
+  const sql = [
+    'UPDATE threads',
+    `SET title = ${quoteSqliteString(nextTitle)},`,
+    "    updated_at = CAST(strftime('%s','now') AS INTEGER)",
+    `WHERE id = ${quoteSqliteString(targetThreadId)};`,
+  ].join(' ');
+
+  const result = spawnSync('sqlite3', [dbPath, sql], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    console.error(`codex_thread_title_sync=error thread_id=${targetThreadId} message=${compactText(result.stderr || result.stdout || 'sqlite3 failed', 400)}`);
+    return false;
+  }
+  return true;
+}
+
+function readCodexThreadExecutionPolicy(threadId) {
+  const targetThreadId = String(threadId || '').trim();
+  if (!targetThreadId) return null;
+
+  const dbPath = resolveCodexStateDbPath();
+  if (!dbPath) return null;
+
+  const sql = [
+    'SELECT sandbox_policy, approval_mode',
+    'FROM threads',
+    `WHERE id = ${quoteSqliteString(targetThreadId)}`,
+    'LIMIT 1;',
+  ].join(' ');
+  const result = spawnSync('sqlite3', ['-json', dbPath, sql], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    console.error(`codex_thread_policy=error thread_id=${targetThreadId} message=${compactText(result.stderr || result.stdout || 'sqlite3 failed', 400)}`);
+    return null;
+  }
+
+  let rows = [];
+  try {
+    rows = JSON.parse(String(result.stdout || '[]'));
+  } catch (_) {
+    rows = [];
+  }
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) return null;
+
+  let sandboxType = '';
+  try {
+    const parsed = typeof row.sandbox_policy === 'string'
+      ? JSON.parse(row.sandbox_policy)
+      : row.sandbox_policy;
+    sandboxType = String(parsed?.type || '').trim();
+  } catch (_) {
+    sandboxType = '';
+  }
+
+  return {
+    sandboxType,
+    approvalMode: String(row.approval_mode || '').trim(),
+  };
+}
+
+function buildCodexPrompt({
+  systemPrompt,
+  history,
+  userText,
+  imageCount = 0,
+  cwd = '',
+  addDirs = [],
+  threadTitle = '',
+}) {
   const lines = [];
+  const title = String(threadTitle || '').trim();
+  if (title) {
+    lines.push(title);
+    lines.push('');
+  }
   lines.push(systemPrompt || DEFAULT_CODEX_SYSTEM_PROMPT);
   lines.push('');
   lines.push(`当前工作目录：${cwd || process.cwd()}`);
@@ -2062,6 +2194,7 @@ function buildCodexPrompt({ systemPrompt, history, userText, imageCount = 0, cwd
   lines.push('');
   lines.push('请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原文。');
   lines.push('禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。');
+  lines.push('如果 SSH、curl、nc 或其他网络命令失败，不要直接归因于“当前会话不能联网”或“网络策略拦截”。先报告原始报错，再用更小的连通性探测复核后再下结论。');
   lines.push(`如果你需要机器人把本机图片直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
   lines.push(`如果你需要机器人把本机文件直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
   lines.push('可以输出多行，每行一个附件。除这些指令外，其他文字都会作为正常回复发送给用户。');
@@ -2083,10 +2216,16 @@ function buildCodexResumePrompt({ userText, imageCount = 0 }) {
   lines.push('');
   lines.push('请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原文。');
   lines.push('禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。');
+  lines.push('如果 SSH、curl、nc 或其他网络命令失败，不要直接归因于“当前会话不能联网”或“网络策略拦截”。先报告原始报错，再用更小的连通性探测复核后再下结论。');
   lines.push(`如果你需要机器人把本机图片直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
   lines.push(`如果你需要机器人把本机文件直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
   lines.push('可以输出多行，每行一个附件。除这些指令外，其他文字都会作为正常回复发送给用户。');
   return lines.join('\n');
+}
+
+function shouldBypassCodexSandbox(sandbox, approvalPolicy) {
+  return String(sandbox || '').trim() === 'danger-full-access'
+    && String(approvalPolicy || '').trim() === 'never';
 }
 
 function runCodexExec({
@@ -2102,6 +2241,7 @@ function runCodexExec({
   prompt,
   imagePaths = [],
   resumeSessionId = '',
+  onSpawn = null,
   onEvent = null,
 }) {
   return new Promise((resolve, reject) => {
@@ -2109,10 +2249,12 @@ function runCodexExec({
     const outputFile = path.join(tempDir, 'last-message.txt');
 
     const resumeId = String(resumeSessionId || '').trim();
+    const bypassSandbox = shouldBypassCodexSandbox(sandbox, approvalPolicy);
     const args = resumeId
       ? ['exec', 'resume', '--skip-git-repo-check', '--json']
       : ['exec', '--skip-git-repo-check', '--json'];
 
+    if (bypassSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
     if (model) args.push('-m', model);
     if (reasoningEffort) args.push('-c', `model_reasoning_effort=\"${reasoningEffort}\"`);
     if (!resumeId && profile) args.push('-p', profile);
@@ -2123,8 +2265,8 @@ function runCodexExec({
         args.push('--add-dir', dir);
       }
     }
-    if (!resumeId && sandbox) args.push('-s', sandbox);
-    if (approvalPolicy) args.push('-c', `approval_policy=\"${approvalPolicy}\"`);
+    if (!resumeId && sandbox && !bypassSandbox) args.push('-s', sandbox);
+    if (approvalPolicy && !bypassSandbox) args.push('-c', `approval_policy=\"${approvalPolicy}\"`);
     for (const imagePath of imagePaths || []) {
       if (!String(imagePath || '').trim()) continue;
       args.push('-i', imagePath);
@@ -2145,6 +2287,13 @@ function runCodexExec({
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    if (typeof onSpawn === 'function') {
+      try {
+        onSpawn(child);
+      } catch (_) {
+        // ignore spawn hook errors
+      }
+    }
 
     let stderr = '';
     let stdout = '';
@@ -2235,9 +2384,11 @@ async function generateCodexReply({
   userText,
   imagePaths = [],
   sessionId = '',
+  threadTitle = '',
+  onSpawn = null,
   onProgressEvent = null,
 }) {
-  const resolvedSessionId = String(sessionId || '').trim();
+  let resolvedSessionId = String(sessionId || '').trim();
   const imageCount = Array.isArray(imagePaths) ? imagePaths.length : 0;
   const runExec = async ({ prompt, resumeSessionId = '' }) => {
     return runCodexExec({
@@ -2253,9 +2404,24 @@ async function generateCodexReply({
       prompt,
       imagePaths,
       resumeSessionId,
+      onSpawn,
       onEvent: onProgressEvent,
     });
   };
+
+  if (resolvedSessionId) {
+    const existingPolicy = readCodexThreadExecutionPolicy(resolvedSessionId);
+    const expectedSandboxType = String(codex.sandbox || '').trim();
+    const expectedApprovalMode = String(codex.approvalPolicy || '').trim();
+    if (
+      !existingPolicy
+      || (expectedSandboxType && existingPolicy.sandboxType && existingPolicy.sandboxType !== expectedSandboxType)
+      || (expectedApprovalMode && existingPolicy.approvalMode && existingPolicy.approvalMode !== expectedApprovalMode)
+    ) {
+      console.log(`codex_resume_skip thread_id=${resolvedSessionId} reason=policy_mismatch existing_sandbox=${existingPolicy?.sandboxType || '(unknown)'} existing_approval=${existingPolicy?.approvalMode || '(unknown)'} expected_sandbox=${expectedSandboxType || '(none)'} expected_approval=${expectedApprovalMode || '(none)'}`);
+      resolvedSessionId = '';
+    }
+  }
 
   if (resolvedSessionId) {
     try {
@@ -2280,6 +2446,7 @@ async function generateCodexReply({
       imageCount,
       cwd: codex.cwd,
       addDirs: codex.addDirs,
+      threadTitle,
     }),
   });
 
@@ -2378,11 +2545,14 @@ async function uploadLocalImageToFeishu(client, localPath) {
   };
 }
 
-async function sendRequestedAttachments(client, chatID, attachments = [], cwd = '') {
+async function sendRequestedAttachments(client, chatID, attachments = [], cwd = '', shouldContinue = null) {
   const sent = [];
   const failed = [];
 
   for (const attachment of attachments || []) {
+    if (typeof shouldContinue === 'function' && !shouldContinue()) {
+      break;
+    }
     const requestedType = attachment?.type === 'image' ? 'image' : 'file';
     const rawPath = attachment?.path || '';
     const resolvedPath = resolveLocalFilePath(rawPath, cwd);
@@ -2483,10 +2653,11 @@ function splitTextForFeishu(text, maxLength = FEISHU_TEXT_CHUNK_LIMIT) {
   return chunks;
 }
 
-async function sendCodexReplyPassthrough(client, chatID, rawText) {
+async function sendCodexReplyPassthrough(client, chatID, rawText, shouldContinue = null) {
   const chunks = splitTextForFeishu(rawText, FEISHU_TEXT_CHUNK_LIMIT);
   let sent = 0;
   for (const chunk of chunks) {
+    if (typeof shouldContinue === 'function' && !shouldContinue()) break;
     if (!chunk) continue;
     await sendTextReply(client, chatID, chunk);
     sent += 1;
@@ -2498,6 +2669,18 @@ function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function makeTaskCancelledError(reason = 'cancelled') {
+  const err = new Error(`task cancelled: ${reason}`);
+  err.code = 'TASK_CANCELLED';
+  err.cancelled = true;
+  err.reason = reason;
+  return err;
+}
+
+function isTaskCancelledError(err) {
+  return Boolean(err && (err.cancelled || err.code === 'TASK_CANCELLED'));
 }
 
 async function sendTextReplySafe(client, chatID, text, logTag = 'reply') {
@@ -2696,6 +2879,15 @@ function createMessageProgressReporter({ client, chatID, initialMessage, minUpda
     async recordFinalReply() {
       return false;
     },
+    async abort() {
+      closed = true;
+      clearTimers();
+      await queue.catch(() => {});
+      if (!messageID) return true;
+      const target = messageID;
+      messageID = '';
+      return recallMessageSafe(client, target, 'progress_message_recall');
+    },
   };
 }
 
@@ -2717,6 +2909,9 @@ function createSilentProgressReporter() {
     },
     async recordFinalReply() {
       return false;
+    },
+    async abort() {
+      return true;
     },
   };
 }
@@ -3034,11 +3229,13 @@ function createDocProgressReporter({
     return flushPending(state);
   }
 
-  async function recallLinkMessage() {
+  async function recallLinkMessage(reason = '') {
     if (!linkMessageID) return false;
-    const recalled = await recallMessageSafe(client, linkMessageID, 'progress_doc_link_recall');
+    const target = linkMessageID;
+    const recalled = await recallMessageSafe(client, target, 'progress_doc_link_recall');
     if (recalled) {
       linkMessageID = '';
+      console.log(`progress_doc_link_recall=ok message_id=${target}${reason ? ` reason=${reason}` : ''}`);
     }
     return recalled;
   }
@@ -3100,16 +3297,19 @@ function createDocProgressReporter({
       await queue.catch(() => {});
 
       if (fallbackReporter) {
-        return fallbackReporter.complete(note);
+        const ok = await fallbackReporter.complete(note);
+        await recallLinkMessage('complete');
+        return ok;
       }
-      return runSerial(async () => {
+      const ok = await runSerial(async () => {
         const ok = await appendStandaloneLines([normalizeProgressSnippet(note, 200) || '执行完成。'], '已完成');
         if (!ok && fallbackReporter) {
           return fallbackReporter.complete(note);
         }
-        await recallLinkMessage();
         return ok;
       });
+      await recallLinkMessage('complete');
+      return ok;
     },
     async fail(note = '处理失败。') {
       if (closed) return false;
@@ -3118,15 +3318,19 @@ function createDocProgressReporter({
       await queue.catch(() => {});
 
       if (fallbackReporter) {
-        return fallbackReporter.fail(note);
+        const ok = await fallbackReporter.fail(note);
+        await recallLinkMessage('fail');
+        return ok;
       }
-      return runSerial(async () => {
+      const ok = await runSerial(async () => {
         const ok = await appendStandaloneLines([normalizeProgressSnippet(note, 200) || '处理失败。'], '失败');
         if (!ok && fallbackReporter) {
           return fallbackReporter.fail(note);
         }
         return ok;
       });
+      await recallLinkMessage('fail');
+      return ok;
     },
     async recordFinalReply(finalReplyText) {
       if (!progressDoc.writeFinalReply) return false;
@@ -3142,6 +3346,16 @@ function createDocProgressReporter({
         if (entry) queueEntries(entry, '已完成');
         return flushPending('已完成');
       });
+    },
+    async abort() {
+      closed = true;
+      clearTimers();
+      await queue.catch(() => {});
+      if (fallbackReporter && typeof fallbackReporter.abort === 'function') {
+        await fallbackReporter.abort();
+      }
+      await recallLinkMessage('abort');
+      return true;
     },
   };
 }
@@ -3311,6 +3525,131 @@ function enqueueByChat(chatQueues, chatID, task) {
   chatQueues.set(chatID, next);
 }
 
+function createChatTaskControl(chatID) {
+  let cancelled = false;
+  let cancelReason = '';
+  let codexChild = null;
+  let killTimer = null;
+  const cancelHooks = [];
+
+  function killCodexChild() {
+    if (!codexChild) return;
+    try {
+      if (codexChild.exitCode === null && !codexChild.killed) {
+        codexChild.kill('SIGTERM');
+      }
+    } catch (_) {
+      // ignore kill errors
+    }
+    if (!killTimer) {
+      killTimer = setTimeout(() => {
+        try {
+          if (codexChild && codexChild.exitCode === null && !codexChild.killed) {
+            codexChild.kill('SIGKILL');
+          }
+        } catch (_) {
+          // ignore kill errors
+        }
+      }, 1500);
+      if (typeof killTimer.unref === 'function') killTimer.unref();
+    }
+  }
+
+  return {
+    chatID,
+    get cancelReason() {
+      return cancelReason;
+    },
+    isCancelled() {
+      return cancelled;
+    },
+    throwIfCancelled() {
+      if (cancelled) throw makeTaskCancelledError(cancelReason);
+    },
+    onCancel(hook) {
+      if (typeof hook !== 'function') return;
+      cancelHooks.push(hook);
+      if (cancelled) {
+        Promise.resolve()
+          .then(() => hook(cancelReason))
+          .catch((err) => {
+            console.error(`task_cancel_hook=error chat_id=${chatID} message=${err.message}`);
+          });
+      }
+    },
+    attachCodexChild(child) {
+      codexChild = child || null;
+      if (cancelled) {
+        killCodexChild();
+      }
+      if (codexChild) {
+        codexChild.once('close', () => {
+          if (killTimer) {
+            clearTimeout(killTimer);
+            killTimer = null;
+          }
+        });
+      }
+    },
+    async cancel(reason = 'superseded') {
+      if (cancelled) return false;
+      cancelled = true;
+      cancelReason = String(reason || 'cancelled');
+      killCodexChild();
+      await Promise.allSettled(
+        cancelHooks.map((hook) => Promise.resolve().then(() => hook(cancelReason)))
+      );
+      return true;
+    },
+  };
+}
+
+function dispatchLatestByChat(chatRunners, chatID, data, handler) {
+  let runner = chatRunners.get(chatID);
+  if (!runner) {
+    runner = {
+      activeTask: null,
+      pendingData: null,
+      draining: false,
+    };
+    chatRunners.set(chatID, runner);
+  }
+
+  runner.pendingData = data;
+  if (runner.activeTask) {
+    console.log(`chat_task_supersede chat_id=${chatID}`);
+    void runner.activeTask.cancel('superseded_by_new_message');
+    return;
+  }
+  if (runner.draining) return;
+
+  runner.draining = true;
+  void (async () => {
+    try {
+      while (runner.pendingData) {
+        const nextData = runner.pendingData;
+        runner.pendingData = null;
+        const taskControl = createChatTaskControl(chatID);
+        runner.activeTask = taskControl;
+        try {
+          await handler(nextData, taskControl);
+        } catch (err) {
+          if (!isTaskCancelledError(err)) {
+            console.error(`chat_task_error chat_id=${chatID} message=${err.message}`);
+          }
+        } finally {
+          runner.activeTask = null;
+        }
+      }
+    } finally {
+      runner.draining = false;
+      if (!runner.activeTask && !runner.pendingData) {
+        chatRunners.delete(chatID);
+      }
+    }
+  })();
+}
+
 async function main() {
   ensure(lark, 'missing dependency @larksuiteoapi/node-sdk; run: npm install');
 
@@ -3397,6 +3736,7 @@ async function main() {
     console.log(`codex_add_dirs=${codex.addDirs.length > 0 ? codex.addDirs.join(' | ') : '(none)'}`);
     console.log(`codex_sandbox=${codex.sandbox}`);
     console.log(`codex_approval_policy=${codex.approvalPolicy}`);
+    console.log(`codex_bypass_sandbox=${shouldBypassCodexSandbox(codex.sandbox, codex.approvalPolicy) ? 'true' : 'false'}`);
     console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
     console.log(`codex_history_turns=${codex.historyTurns}`);
     console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
@@ -3424,10 +3764,10 @@ async function main() {
   const client = new lark.Client(baseConfig);
 
   const chatStates = new Map();
-  const chatQueues = new Map();
+  const chatRunners = new Map();
   const recentMentionedSenders = new Map();
 
-  async function handleMessageEvent(data) {
+  async function handleMessageEvent(data, taskControl = createChatTaskControl('')) {
     const eventData = data || {};
     const senderOpenID = eventData?.sender?.sender_id?.open_id || '';
     const senderType = eventData?.sender?.sender_type || '';
@@ -3444,14 +3784,15 @@ async function main() {
     const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
     const textMentionAlias = detectTextualBotMention(normalizedMessageText, mentionAliases);
     const mentionMatchedByText = Boolean(textMentionAlias);
-    if (!creds.botOpenId.value && mentions.length > 0) {
-      autoDetectAndPersistBotOpenId({
+    const mentionCandidate = mentions.length > 0
+      ? reconcileBotOpenIdFromMentions({
         accountName,
         creds,
         mentions,
         mentionAliases,
-      });
-    }
+      })
+      : null;
+    const mentionMatchedByMentionName = Boolean(mentionCandidate);
     const botMentioned = isBotMentioned(mentions, creds.botOpenId.value);
     const text = normalizeIncomingText(normalizedMessageText, mentions, mentionAliases);
     const now = Date.now();
@@ -3466,7 +3807,7 @@ async function main() {
     const normalizedImageKeys = uniqueStrings(imageKeys);
     const groupChat = isGroupChat(chatType);
     pruneMentionCarryState(recentMentionedSenders, now);
-    const recentMentionState = groupChat && !botMentioned && !mentionMatchedByText
+    const recentMentionState = groupChat && !botMentioned && !mentionMatchedByMentionName && !mentionMatchedByText
       ? getRecentMentionState(recentMentionedSenders, chatID, senderOpenID, now)
       : null;
     const mentionMatchedByCarry = Boolean(
@@ -3480,6 +3821,9 @@ async function main() {
     console.log(`message_id=${messageID}`);
     console.log(`message_type=${messageType}`);
     console.log(`sender_type=${senderType}`);
+    if (mentionMatchedByMentionName && !botMentioned) {
+      console.log(`mention_fallback=mention_name alias=${mentionCandidate?.name || '(unknown)'}`);
+    }
     if (mentionMatchedByText && !botMentioned) {
       console.log(`mention_fallback=text_alias alias=${textMentionAlias}`);
     }
@@ -3508,13 +3852,13 @@ async function main() {
       return;
     }
     const mentionGateActive = mentionConfig.requireMention && (!mentionConfig.groupOnly || groupChat);
-    if (mentionGateActive && !botMentioned && !mentionMatchedByText && !mentionMatchedByCarry) {
+    if (mentionGateActive && !botMentioned && !mentionMatchedByMentionName && !mentionMatchedByText && !mentionMatchedByCarry) {
       console.log('skip_reason=require_mention_not_met');
       console.log(`mention_count=${mentions.length}`);
       console.log(`text_has_at=${/[@＠]/.test(String(normalizedMessageText || '')) ? 'true' : 'false'}`);
       return;
     }
-    if (groupChat && senderOpenID && (botMentioned || mentionMatchedByText)) {
+    if (groupChat && senderOpenID && (botMentioned || mentionMatchedByMentionName || mentionMatchedByText)) {
       rememberRecentMention(recentMentionedSenders, chatID, senderOpenID, textMentionAlias, now);
     }
 
@@ -3688,17 +4032,29 @@ async function main() {
         progressConfig: progress,
       })
       : null;
+    taskControl.onCancel(async () => {
+      if (progressReporter && typeof progressReporter.abort === 'function') {
+        await progressReporter.abort();
+      }
+    });
     const typingState = typing.enabled && messageID
       ? await addTypingIndicatorSafe(client, messageID, typing.emoji)
       : null;
+    taskControl.onCancel(async () => {
+      if (typingState) {
+        await removeTypingIndicatorSafe(client, typingState);
+      }
+    });
 
     try {
+      taskControl.throwIfCancelled();
       if (progressReporter) {
         await progressReporter.start();
       } else if (progress.enabled) {
         await sendTextReplySafe(client, chatID, progress.message, 'progress_notice');
         console.log('progress_notice=sent');
       }
+      taskControl.throwIfCancelled();
 
       let replyText = '';
       if (replyMode === 'codex') {
@@ -3707,13 +4063,23 @@ async function main() {
           throw new Error('current thread not found');
         }
         const history = currentThread.history || [];
+        const codexThreadTitle = buildCodexThreadTitle({
+          botName: botName || accountName,
+          localThreadName: currentThread.name || currentThread.id,
+          userText: historyUserText || userText,
+        });
         const codexReply = await generateCodexReply({
           codex,
           history,
           userText,
           imagePaths,
           sessionId: currentThread.codexThreadId,
+          threadTitle: codexThreadTitle,
+          onSpawn: (child) => {
+            taskControl.attachCodexChild(child);
+          },
           onProgressEvent: (event) => {
+            if (taskControl.isCancelled()) return;
             if (!progressReporter) return;
             if (typeof progressReporter.recordEvent === 'function') {
               progressReporter.recordEvent(event);
@@ -3724,10 +4090,13 @@ async function main() {
             progressReporter.push(stepText);
           },
         });
+        taskControl.throwIfCancelled();
         replyText = codexReply.reply;
         if (codexReply.threadId) {
           currentThread.codexThreadId = codexReply.threadId;
-          console.log(`codex_thread_id=${codexReply.threadId}`);
+          const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle);
+          console.log(`codex_thread_title_sync=${synced ? 'ok' : 'skip'} thread_id=${codexReply.threadId}`);
+          console.log(`codex_thread_id=${codexReply.threadId} chat_id=${chatID} bot=${JSON.stringify(botName || accountName)} local_thread=${currentThread.id}`);
         }
       } else {
         replyText = normalizeReplyText(replyPrefix, userText);
@@ -3739,14 +4108,23 @@ async function main() {
         if (!userReplyText.trim() && attachmentPlan.attachments.length === 0) {
           throw new Error('codex returned empty reply');
         }
+        taskControl.throwIfCancelled();
         if (userReplyText) {
-          await sendCodexReplyPassthrough(client, chatID, userReplyText);
+          await sendCodexReplyPassthrough(client, chatID, userReplyText, () => !taskControl.isCancelled());
         }
-        const attachmentSendResult = await sendRequestedAttachments(client, chatID, attachmentPlan.attachments, codex.cwd || process.cwd());
+        taskControl.throwIfCancelled();
+        const attachmentSendResult = await sendRequestedAttachments(
+          client,
+          chatID,
+          attachmentPlan.attachments,
+          codex.cwd || process.cwd(),
+          () => !taskControl.isCancelled()
+        );
+        taskControl.throwIfCancelled();
         if (!userReplyText && attachmentSendResult.sent.length > 0) {
           userReplyText = buildDefaultAttachmentReply(attachmentSendResult.sent);
           if (userReplyText) {
-            await sendCodexReplyPassthrough(client, chatID, userReplyText);
+            await sendCodexReplyPassthrough(client, chatID, userReplyText, () => !taskControl.isCancelled());
           }
         }
         const attachmentFailureReply = buildAttachmentSendFailureReply(attachmentSendResult.sent, attachmentSendResult.failed);
@@ -3794,6 +4172,15 @@ async function main() {
       const activeThread = getCurrentThread(chatState);
       console.log(`reply=ok mode=${replyMode} thread=${activeThread ? activeThread.id : ''}`);
     } catch (err) {
+      if (taskControl.isCancelled() || isTaskCancelledError(err)) {
+        const currentThread = getCurrentThread(chatState);
+        if (currentThread) {
+          currentThread.codexThreadId = '';
+          currentThread.updatedAt = Date.now();
+        }
+        console.log(`reply=cancelled mode=${replyMode} reason=${taskControl.cancelReason || err.reason || err.message}`);
+        return;
+      }
       console.error(`reply=error mode=${replyMode} message=${err.message}`);
       if (progressReporter) {
         await progressReporter.fail(`处理失败：${err.message}`);
@@ -3819,7 +4206,7 @@ async function main() {
   }).register({
     'im.message.receive_v1': (data) => {
       const chatID = data?.message?.chat_id || 'unknown';
-      enqueueByChat(chatQueues, chatID, () => handleMessageEvent(data));
+      dispatchLatestByChat(chatRunners, chatID, data, handleMessageEvent);
     },
   });
 
@@ -3873,10 +4260,11 @@ async function main() {
     console.log(`codex_profile=${codex.profile || '(default)'}`);
     console.log(`codex_cwd=${codex.cwd || process.cwd()}`);
     console.log(`codex_add_dirs=${codex.addDirs.length > 0 ? codex.addDirs.join(' | ') : '(none)'}`);
-    console.log(`codex_sandbox=${codex.sandbox}`);
-    console.log(`codex_approval_policy=${codex.approvalPolicy}`);
-    console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
-    console.log(`codex_history_turns=${codex.historyTurns}`);
+  console.log(`codex_sandbox=${codex.sandbox}`);
+  console.log(`codex_approval_policy=${codex.approvalPolicy}`);
+  console.log(`codex_bypass_sandbox=${shouldBypassCodexSandbox(codex.sandbox, codex.approvalPolicy) ? 'true' : 'false'}`);
+  console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
+  console.log(`codex_history_turns=${codex.historyTurns}`);
   }
   console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
   console.log(`speech_model=${speech.model}`);
