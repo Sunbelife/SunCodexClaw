@@ -1887,6 +1887,7 @@ function makeThread(threadId, name = '') {
   return {
     id: threadId,
     name: threadName,
+    codexThreadId: '',
     history: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -2070,6 +2071,24 @@ function buildCodexPrompt({ systemPrompt, history, userText, imageCount = 0, cwd
   return lines.join('\n');
 }
 
+function buildCodexResumePrompt({ userText, imageCount = 0 }) {
+  const lines = [];
+  lines.push('继续当前线程。下面是用户最新消息，请直接回复用户。');
+  lines.push('');
+  lines.push('用户最新消息：');
+  lines.push(compactText(userText, 2000));
+  if (imageCount > 0) {
+    lines.push(`附加图片：${imageCount} 张（请结合图片内容回答）。`);
+  }
+  lines.push('');
+  lines.push('请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原文。');
+  lines.push('禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。');
+  lines.push(`如果你需要机器人把本机图片直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
+  lines.push(`如果你需要机器人把本机文件直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
+  lines.push('可以输出多行，每行一个附件。除这些指令外，其他文字都会作为正常回复发送给用户。');
+  return lines.join('\n');
+}
+
 function runCodexExec({
   bin,
   model,
@@ -2082,28 +2101,37 @@ function runCodexExec({
   apiKey = '',
   prompt,
   imagePaths = [],
+  resumeSessionId = '',
   onEvent = null,
 }) {
   return new Promise((resolve, reject) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-codex-'));
     const outputFile = path.join(tempDir, 'last-message.txt');
 
-    const args = ['exec', '--ephemeral', '--skip-git-repo-check', '--json'];
+    const resumeId = String(resumeSessionId || '').trim();
+    const args = resumeId
+      ? ['exec', 'resume', '--skip-git-repo-check', '--json']
+      : ['exec', '--skip-git-repo-check', '--json'];
+
     if (model) args.push('-m', model);
     if (reasoningEffort) args.push('-c', `model_reasoning_effort=\"${reasoningEffort}\"`);
-    if (profile) args.push('-p', profile);
-    if (cwd) args.push('-C', cwd);
-    for (const dir of addDirs || []) {
-      if (!String(dir || '').trim()) continue;
-      args.push('--add-dir', dir);
+    if (!resumeId && profile) args.push('-p', profile);
+    if (!resumeId && cwd) args.push('-C', cwd);
+    if (!resumeId) {
+      for (const dir of addDirs || []) {
+        if (!String(dir || '').trim()) continue;
+        args.push('--add-dir', dir);
+      }
     }
-    if (sandbox) args.push('-s', sandbox);
+    if (!resumeId && sandbox) args.push('-s', sandbox);
     if (approvalPolicy) args.push('-c', `approval_policy=\"${approvalPolicy}\"`);
     for (const imagePath of imagePaths || []) {
       if (!String(imagePath || '').trim()) continue;
       args.push('-i', imagePath);
     }
-    args.push('--output-last-message', outputFile, '-');
+    args.push('--output-last-message', outputFile);
+    if (resumeId) args.push(resumeId);
+    args.push('-');
 
     const childEnv = { ...process.env };
     const resolvedApiKey = String(apiKey || '').trim();
@@ -2121,6 +2149,7 @@ function runCodexExec({
     let stderr = '';
     let stdout = '';
     let stdoutJsonBuffer = '';
+    let observedThreadId = resumeId;
 
     function emitEvent(evt) {
       if (!onEvent) return;
@@ -2135,7 +2164,11 @@ function runCodexExec({
       const trimmed = String(line || '').trim();
       if (!trimmed) return;
       try {
-        emitEvent(JSON.parse(trimmed));
+        const parsed = JSON.parse(trimmed);
+        if (parsed?.type === 'thread.started' && parsed?.thread_id) {
+          observedThreadId = String(parsed.thread_id || '').trim() || observedThreadId;
+        }
+        emitEvent(parsed);
       } catch (_) {
         emitEvent({ type: 'raw', text: trimmed });
       }
@@ -2181,7 +2214,10 @@ function runCodexExec({
       try {
         const reply = fs.readFileSync(outputFile, 'utf8');
         fs.rmSync(tempDir, { recursive: true, force: true });
-        resolve(reply);
+        resolve({
+          reply,
+          threadId: observedThreadId,
+        });
       } catch (err) {
         fs.rmSync(tempDir, { recursive: true, force: true });
         reject(new Error(`read codex output failed: ${err.message}`));
@@ -2193,32 +2229,64 @@ function runCodexExec({
   });
 }
 
-async function generateCodexReply({ codex, history, userText, imagePaths = [], onProgressEvent = null }) {
-  const prompt = buildCodexPrompt({
-    systemPrompt: codex.systemPrompt,
-    history,
-    userText,
-    imageCount: Array.isArray(imagePaths) ? imagePaths.length : 0,
-    cwd: codex.cwd,
-    addDirs: codex.addDirs,
+async function generateCodexReply({
+  codex,
+  history,
+  userText,
+  imagePaths = [],
+  sessionId = '',
+  onProgressEvent = null,
+}) {
+  const resolvedSessionId = String(sessionId || '').trim();
+  const imageCount = Array.isArray(imagePaths) ? imagePaths.length : 0;
+  const runExec = async ({ prompt, resumeSessionId = '' }) => {
+    return runCodexExec({
+      bin: codex.bin,
+      model: codex.model,
+      reasoningEffort: codex.reasoningEffort,
+      profile: codex.profile,
+      cwd: codex.cwd,
+      addDirs: codex.addDirs,
+      apiKey: codex.apiKey,
+      sandbox: codex.sandbox,
+      approvalPolicy: codex.approvalPolicy,
+      prompt,
+      imagePaths,
+      resumeSessionId,
+      onEvent: onProgressEvent,
+    });
+  };
+
+  if (resolvedSessionId) {
+    try {
+      const resumed = await runExec({
+        prompt: buildCodexResumePrompt({ userText, imageCount }),
+        resumeSessionId: resolvedSessionId,
+      });
+      return {
+        reply: String(resumed?.reply || ''),
+        threadId: String(resumed?.threadId || resolvedSessionId),
+      };
+    } catch (err) {
+      console.error(`codex_resume=error thread_id=${resolvedSessionId} message=${err.message}`);
+    }
+  }
+
+  const fresh = await runExec({
+    prompt: buildCodexPrompt({
+      systemPrompt: codex.systemPrompt,
+      history,
+      userText,
+      imageCount,
+      cwd: codex.cwd,
+      addDirs: codex.addDirs,
+    }),
   });
 
-  const reply = await runCodexExec({
-    bin: codex.bin,
-    model: codex.model,
-    reasoningEffort: codex.reasoningEffort,
-    profile: codex.profile,
-    cwd: codex.cwd,
-    addDirs: codex.addDirs,
-    apiKey: codex.apiKey,
-    sandbox: codex.sandbox,
-    approvalPolicy: codex.approvalPolicy,
-    prompt,
-    imagePaths,
-    onEvent: onProgressEvent,
-  });
-
-  return String(reply || '');
+  return {
+    reply: String(fresh?.reply || ''),
+    threadId: String(fresh?.threadId || ''),
+  };
 }
 
 async function sendTextReply(client, chatID, text) {
@@ -2384,6 +2452,14 @@ async function updateTextMessage(client, messageID, text) {
   });
 }
 
+async function recallMessage(client, messageID) {
+  return client.im.v1.message.delete({
+    path: {
+      message_id: messageID,
+    },
+  });
+}
+
 function splitTextForFeishu(text, maxLength = FEISHU_TEXT_CHUNK_LIMIT) {
   const raw = String(text || '').replace(/\r/g, '');
   if (!raw) return [];
@@ -2430,6 +2506,28 @@ async function sendTextReplySafe(client, chatID, text, logTag = 'reply') {
     return true;
   } catch (err) {
     console.error(`${logTag}=error message=${err.message}`);
+    return false;
+  }
+}
+
+async function sendTextReplyWithMessageIdSafe(client, chatID, text, logTag = 'reply') {
+  try {
+    const created = await sendTextReply(client, chatID, text);
+    return String(created?.data?.message_id || '').trim();
+  } catch (err) {
+    console.error(`${logTag}=error message=${err.message}`);
+    return '';
+  }
+}
+
+async function recallMessageSafe(client, messageID, logTag = 'message_recall') {
+  const target = String(messageID || '').trim();
+  if (!target) return false;
+  try {
+    await recallMessage(client, target);
+    return true;
+  } catch (err) {
+    console.error(`${logTag}=error message_id=${target} message=${err.message}`);
     return false;
   }
 }
@@ -2753,6 +2851,7 @@ function createDocProgressReporter({
   let queue = Promise.resolve();
   let closed = false;
   let linkAnnounced = false;
+  let linkMessageID = '';
   let lastStatusText = '';
   let lastFlushAt = 0;
 
@@ -2858,8 +2957,11 @@ function createDocProgressReporter({
         const linkText = documentURL
           ? `进度文档：${documentURL}\n后续过程会持续写入该文档。`
           : `进度文档已创建，文档 ID：${documentID}\n后续过程会持续写入该文档。`;
-        await sendTextReplySafe(client, chatID, linkText, 'progress_doc_link');
-        linkAnnounced = true;
+        const sentLinkMessageID = await sendTextReplyWithMessageIdSafe(client, chatID, linkText, 'progress_doc_link');
+        if (sentLinkMessageID) {
+          linkMessageID = sentLinkMessageID;
+          linkAnnounced = true;
+        }
       }
       return true;
     } catch (err) {
@@ -2932,6 +3034,15 @@ function createDocProgressReporter({
     return flushPending(state);
   }
 
+  async function recallLinkMessage() {
+    if (!linkMessageID) return false;
+    const recalled = await recallMessageSafe(client, linkMessageID, 'progress_doc_link_recall');
+    if (recalled) {
+      linkMessageID = '';
+    }
+    return recalled;
+  }
+
   return {
     async start() {
       await runSerial(async () => {
@@ -2996,6 +3107,7 @@ function createDocProgressReporter({
         if (!ok && fallbackReporter) {
           return fallbackReporter.complete(note);
         }
+        await recallLinkMessage();
         return ok;
       });
     },
@@ -3554,6 +3666,7 @@ async function main() {
           return;
         }
         currentThread.history = [];
+        currentThread.codexThreadId = '';
         currentThread.updatedAt = Date.now();
         await sendTextReplySafe(
           client,
@@ -3594,11 +3707,12 @@ async function main() {
           throw new Error('current thread not found');
         }
         const history = currentThread.history || [];
-        replyText = await generateCodexReply({
+        const codexReply = await generateCodexReply({
           codex,
           history,
           userText,
           imagePaths,
+          sessionId: currentThread.codexThreadId,
           onProgressEvent: (event) => {
             if (!progressReporter) return;
             if (typeof progressReporter.recordEvent === 'function') {
@@ -3610,6 +3724,11 @@ async function main() {
             progressReporter.push(stepText);
           },
         });
+        replyText = codexReply.reply;
+        if (codexReply.threadId) {
+          currentThread.codexThreadId = codexReply.threadId;
+          console.log(`codex_thread_id=${codexReply.threadId}`);
+        }
       } else {
         replyText = normalizeReplyText(replyPrefix, userText);
       }
