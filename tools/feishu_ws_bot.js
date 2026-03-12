@@ -1255,6 +1255,34 @@ function isGroupChat(chatType) {
   return normalized !== 'p2p';
 }
 
+function buildConversationScope(chatID, chatType, senderOpenID, messageID = '') {
+  const chat = String(chatID || '').trim();
+  if (!chat) {
+    return {
+      key: '',
+      stateKey: '',
+      kind: 'missing_chat',
+    };
+  }
+  if (!isGroupChat(chatType)) {
+    return {
+      key: chat,
+      stateKey: chat,
+      kind: 'p2p',
+    };
+  }
+
+  const sender = String(senderOpenID || '').trim();
+  const fallbackMessage = String(messageID || '').trim();
+  const senderKey = sender || (fallbackMessage ? `message:${fallbackMessage}` : 'unknown_sender');
+  const scoped = `${chat}::${senderKey}`;
+  return {
+    key: scoped,
+    stateKey: scoped,
+    kind: sender ? 'group_sender' : 'group_message_fallback',
+  };
+}
+
 function buildMentionCarryKey(chatID, senderOpenID) {
   const chat = String(chatID || '').trim();
   const sender = String(senderOpenID || '').trim();
@@ -1903,8 +1931,8 @@ function makeThread(threadId, name = '') {
   };
 }
 
-function ensureChatState(chatStates, chatID) {
-  const cached = chatStates.get(chatID);
+function ensureChatState(chatStates, stateKey) {
+  const cached = chatStates.get(stateKey);
   if (cached) return cached;
 
   const firstThread = makeThread('t1', '主线程');
@@ -1914,7 +1942,7 @@ function ensureChatState(chatStates, chatID) {
     currentThreadId: firstThread.id,
     nextThreadSeq: 2,
   };
-  chatStates.set(chatID, state);
+  chatStates.set(stateKey, state);
   return state;
 }
 
@@ -3525,7 +3553,7 @@ function enqueueByChat(chatQueues, chatID, task) {
   chatQueues.set(chatID, next);
 }
 
-function createChatTaskControl(chatID) {
+function createChatTaskControl(taskKey) {
   let cancelled = false;
   let cancelReason = '';
   let codexChild = null;
@@ -3556,7 +3584,7 @@ function createChatTaskControl(chatID) {
   }
 
   return {
-    chatID,
+    taskKey,
     get cancelReason() {
       return cancelReason;
     },
@@ -3573,7 +3601,7 @@ function createChatTaskControl(chatID) {
         Promise.resolve()
           .then(() => hook(cancelReason))
           .catch((err) => {
-            console.error(`task_cancel_hook=error chat_id=${chatID} message=${err.message}`);
+            console.error(`task_cancel_hook=error task_key=${taskKey} message=${err.message}`);
           });
       }
     },
@@ -3604,20 +3632,20 @@ function createChatTaskControl(chatID) {
   };
 }
 
-function dispatchLatestByChat(chatRunners, chatID, data, handler) {
-  let runner = chatRunners.get(chatID);
+function dispatchLatestByChat(chatRunners, taskKey, data, handler) {
+  let runner = chatRunners.get(taskKey);
   if (!runner) {
     runner = {
       activeTask: null,
       pendingData: null,
       draining: false,
     };
-    chatRunners.set(chatID, runner);
+    chatRunners.set(taskKey, runner);
   }
 
   runner.pendingData = data;
   if (runner.activeTask) {
-    console.log(`chat_task_supersede chat_id=${chatID}`);
+    console.log(`chat_task_supersede task_key=${taskKey}`);
     void runner.activeTask.cancel('superseded_by_new_message');
     return;
   }
@@ -3629,13 +3657,13 @@ function dispatchLatestByChat(chatRunners, chatID, data, handler) {
       while (runner.pendingData) {
         const nextData = runner.pendingData;
         runner.pendingData = null;
-        const taskControl = createChatTaskControl(chatID);
+        const taskControl = createChatTaskControl(taskKey);
         runner.activeTask = taskControl;
         try {
           await handler(nextData, taskControl);
         } catch (err) {
           if (!isTaskCancelledError(err)) {
-            console.error(`chat_task_error chat_id=${chatID} message=${err.message}`);
+            console.error(`chat_task_error task_key=${taskKey} message=${err.message}`);
           }
         } finally {
           runner.activeTask = null;
@@ -3644,7 +3672,7 @@ function dispatchLatestByChat(chatRunners, chatID, data, handler) {
     } finally {
       runner.draining = false;
       if (!runner.activeTask && !runner.pendingData) {
-        chatRunners.delete(chatID);
+        chatRunners.delete(taskKey);
       }
     }
   })();
@@ -3784,6 +3812,7 @@ async function main() {
     const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
     const textMentionAlias = detectTextualBotMention(normalizedMessageText, mentionAliases);
     const mentionMatchedByText = Boolean(textMentionAlias);
+    const conversationScope = buildConversationScope(chatID, chatType, senderOpenID, messageID);
     const mentionCandidate = mentions.length > 0
       ? reconcileBotOpenIdFromMentions({
         accountName,
@@ -3818,6 +3847,10 @@ async function main() {
     console.log('event=im.message.receive_v1');
     console.log(`chat_id=${chatID}`);
     console.log(`chat_type=${chatType || '(unknown)'}`);
+    if (conversationScope.key) {
+      console.log(`chat_scope=${conversationScope.key}`);
+      console.log(`chat_scope_kind=${conversationScope.kind}`);
+    }
     console.log(`message_id=${messageID}`);
     console.log(`message_type=${messageType}`);
     console.log(`sender_type=${senderType}`);
@@ -3989,7 +4022,7 @@ async function main() {
       }
     }
 
-    const chatState = ensureChatState(chatStates, chatID);
+    const chatState = ensureChatState(chatStates, conversationScope.stateKey || chatID);
     if (messageType === 'text') {
       const threadCommand = parseThreadCommand(userText);
       if (threadCommand) {
@@ -4205,8 +4238,14 @@ async function main() {
     loggerLevel: lark.LoggerLevel.info,
   }).register({
     'im.message.receive_v1': (data) => {
-      const chatID = data?.message?.chat_id || 'unknown';
-      dispatchLatestByChat(chatRunners, chatID, data, handleMessageEvent);
+      const message = data?.message || {};
+      const chatID = message.chat_id || 'unknown';
+      const chatType = message.chat_type || '';
+      const messageID = message.message_id || '';
+      const senderOpenID = data?.sender?.sender_id?.open_id || '';
+      const conversationScope = buildConversationScope(chatID, chatType, senderOpenID, messageID);
+      const taskKey = conversationScope.key || chatID || messageID || 'unknown';
+      dispatchLatestByChat(chatRunners, taskKey, data, handleMessageEvent);
     },
   });
 
