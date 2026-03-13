@@ -35,6 +35,7 @@ const DEFAULT_CODEX_SYSTEM_PROMPT = [
 ].join('\n');
 const MAX_IMAGE_INPUTS = 6;
 const FEISHU_TEXT_CHUNK_LIMIT = 4000;
+const FEISHU_MARKDOWN_CARD_CHUNK_LIMIT = 4000;
 const FEISHU_FILE_UPLOAD_LIMIT = 30 * 1024 * 1024;
 const FEISHU_IMAGE_UPLOAD_LIMIT = 10 * 1024 * 1024;
 const FEISHU_SEND_FILE_DIRECTIVE_PREFIX = '[[FEISHU_SEND_FILE:';
@@ -1283,6 +1284,67 @@ function buildConversationScope(chatID, chatType, senderOpenID, messageID = '') 
   };
 }
 
+function isCarryEligibleMessageType(messageType) {
+  const normalized = String(messageType || '').trim().toLowerCase();
+  return normalized === 'file' || normalized === 'image' || normalized === 'post' || normalized === 'audio';
+}
+
+function hasExplicitBotMentionInMessage(message, mentionAliases = [], botOpenId = '') {
+  const targetMessage = message || {};
+  const messageType = String(targetMessage?.message_type || '').trim().toLowerCase();
+  const mentions = Array.isArray(targetMessage?.mentions) ? targetMessage.mentions : [];
+  const parsedText = messageType === 'text' ? parseMessageText(targetMessage?.content || '') : '';
+  const parsedPost = messageType === 'post' ? parsePostContent(targetMessage?.content || '') : { text: '' };
+  const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
+  if (isBotMentioned(mentions, botOpenId)) return true;
+  if (detectBotOpenIdCandidate(mentions, mentionAliases)) return true;
+  return Boolean(detectTextualBotMention(normalizedMessageText, mentionAliases));
+}
+
+function buildDispatchEnvelope(data, { mentionAliases = [], botOpenId = '', recentMentionedSenders = null } = {}) {
+  const eventData = data || {};
+  const message = eventData?.message || {};
+  const chatID = String(message.chat_id || '').trim();
+  const chatType = String(message.chat_type || '').trim().toLowerCase();
+  const messageID = String(message.message_id || '').trim();
+  const senderOpenID = String(eventData?.sender?.sender_id?.open_id || '').trim();
+  const messageType = String(message.message_type || '').trim().toLowerCase();
+  const now = Date.now();
+  const conversationScope = buildConversationScope(chatID, chatType, senderOpenID, messageID);
+  const explicitBotMention = hasExplicitBotMentionInMessage(message, mentionAliases, botOpenId);
+
+  let allowMentionCarry = false;
+  if (isGroupChat(chatType)) {
+    if (explicitBotMention && senderOpenID && recentMentionedSenders) {
+      const parsedText = messageType === 'text' ? parseMessageText(message.content || '') : '';
+      const parsedPost = messageType === 'post' ? parsePostContent(message.content || '') : { text: '' };
+      const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
+      const textMentionAlias = detectTextualBotMention(normalizedMessageText, mentionAliases);
+      rememberRecentMention(recentMentionedSenders, chatID, senderOpenID, textMentionAlias, now);
+    } else if (
+      recentMentionedSenders
+      && senderOpenID
+      && isCarryEligibleMessageType(messageType)
+    ) {
+      pruneMentionCarryState(recentMentionedSenders, now);
+      allowMentionCarry = Boolean(getRecentMentionState(recentMentionedSenders, chatID, senderOpenID, now));
+    }
+  }
+
+  return {
+    taskKey: conversationScope.key || chatID || messageID || 'unknown',
+    shouldSupersedeActiveTask: !isGroupChat(chatType) || explicitBotMention,
+    payload: {
+      eventData,
+      dispatchMeta: {
+        explicitBotMention,
+        allowMentionCarry,
+        receivedAt: now,
+      },
+    },
+  };
+}
+
 function buildMentionCarryKey(chatID, senderOpenID) {
   const chat = String(chatID || '').trim();
   const sender = String(senderOpenID || '').trim();
@@ -2497,6 +2559,43 @@ async function sendTextReply(client, chatID, text) {
   });
 }
 
+async function sendMarkdownCardReply(client, chatID, markdown, title = 'AI 回复') {
+  const safeMarkdown = String(markdown || '').replace(/\r/g, '').trim();
+  ensure(safeMarkdown, 'markdown reply is empty');
+  const safeTitle = compactText(String(title || '').trim() || 'AI 回复', 60);
+  const card = {
+    config: {
+      wide_screen_mode: true,
+      enable_forward: true,
+    },
+    elements: [
+      {
+        tag: 'markdown',
+        content: safeMarkdown,
+      },
+    ],
+  };
+  if (safeTitle) {
+    card.header = {
+      template: 'blue',
+      title: {
+        tag: 'plain_text',
+        content: safeTitle,
+      },
+    };
+  }
+  return client.im.v1.message.create({
+    params: {
+      receive_id_type: 'chat_id',
+    },
+    data: {
+      receive_id: chatID,
+      content: JSON.stringify(card),
+      msg_type: 'interactive',
+    },
+  });
+}
+
 async function sendFileReply(client, chatID, fileKey) {
   return client.im.v1.message.create({
     params: {
@@ -2681,16 +2780,70 @@ function splitTextForFeishu(text, maxLength = FEISHU_TEXT_CHUNK_LIMIT) {
   return chunks;
 }
 
-async function sendCodexReplyPassthrough(client, chatID, rawText, shouldContinue = null) {
-  const chunks = splitTextForFeishu(rawText, FEISHU_TEXT_CHUNK_LIMIT);
+function shouldRenderFeishuMarkdown(rawText) {
+  const text = String(rawText || '').replace(/\r/g, '').trim();
+  if (!text) return false;
+  if (text.includes('```')) return true;
+  if (/`[^`\n]+`/.test(text)) return true;
+  if (/\[[^\]]+\]\([^)]+\)/.test(text)) return true;
+  if (/(\*\*|__|~~).+?\1/.test(text)) return true;
+
+  const lines = text.split('\n');
+  let structuralHits = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    if (/^#{1,6}\s/.test(line)) return true;
+    if (/^>\s+/.test(line)) return true;
+    if (/^\s*[-*+]\s+/.test(line)) structuralHits += 1;
+    if (/^\s*\d+\.\s+/.test(line)) structuralHits += 1;
+    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1].trim())) {
+      return true;
+    }
+  }
+  return structuralHits >= 2;
+}
+
+async function sendRenderedReply(client, chatID, rawText, {
+  shouldContinue = null,
+  logTag = 'reply',
+  title = 'AI 回复',
+  preferMarkdown = true,
+} = {}) {
+  const normalized = String(rawText || '').replace(/\r/g, '').trim();
+  if (!normalized) return 0;
+
+  const renderMarkdown = preferMarkdown && shouldRenderFeishuMarkdown(normalized);
+  const chunkLimit = renderMarkdown ? FEISHU_MARKDOWN_CARD_CHUNK_LIMIT : FEISHU_TEXT_CHUNK_LIMIT;
+  const chunks = splitTextForFeishu(normalized, chunkLimit);
   let sent = 0;
-  for (const chunk of chunks) {
+  for (let idx = 0; idx < chunks.length; idx += 1) {
+    const chunk = chunks[idx];
     if (typeof shouldContinue === 'function' && !shouldContinue()) break;
     if (!chunk) continue;
+    if (renderMarkdown) {
+      const chunkTitle = chunks.length > 1 ? `${title} (${idx + 1}/${chunks.length})` : title;
+      try {
+        await sendMarkdownCardReply(client, chatID, chunk, chunkTitle);
+        sent += 1;
+        continue;
+      } catch (err) {
+        console.error(`${logTag}_markdown=error part=${idx + 1}/${chunks.length} message=${err.message}`);
+      }
+    }
     await sendTextReply(client, chatID, chunk);
     sent += 1;
   }
   return sent;
+}
+
+async function sendCodexReplyPassthrough(client, chatID, rawText, shouldContinue = null) {
+  return sendRenderedReply(client, chatID, rawText, {
+    shouldContinue,
+    logTag: 'reply',
+    title: 'AI 回复',
+    preferMarkdown: true,
+  });
 }
 
 function sleep(ms) {
@@ -3632,31 +3785,40 @@ function createChatTaskControl(taskKey) {
   };
 }
 
-function dispatchLatestByChat(chatRunners, taskKey, data, handler) {
+function dispatchLatestByChat(chatRunners, taskKey, data, handler, options = {}) {
+  const shouldSupersede = typeof options.shouldSupersede === 'function'
+    ? options.shouldSupersede
+    : () => true;
   let runner = chatRunners.get(taskKey);
   if (!runner) {
     runner = {
       activeTask: null,
-      pendingData: null,
+      pendingQueue: [],
       draining: false,
     };
     chatRunners.set(taskKey, runner);
   }
 
-  runner.pendingData = data;
   if (runner.activeTask) {
-    console.log(`chat_task_supersede task_key=${taskKey}`);
-    void runner.activeTask.cancel('superseded_by_new_message');
+    if (shouldSupersede(runner.activeTask, data)) {
+      runner.pendingQueue = [data];
+      console.log(`chat_task_supersede task_key=${taskKey}`);
+      void runner.activeTask.cancel('superseded_by_new_message');
+    } else {
+      runner.pendingQueue.push(data);
+      console.log(`chat_task_queue task_key=${taskKey}`);
+    }
     return;
   }
+
+  runner.pendingQueue.push(data);
   if (runner.draining) return;
 
   runner.draining = true;
   void (async () => {
     try {
-      while (runner.pendingData) {
-        const nextData = runner.pendingData;
-        runner.pendingData = null;
+      while (runner.pendingQueue.length > 0) {
+        const nextData = runner.pendingQueue.shift();
         const taskControl = createChatTaskControl(taskKey);
         runner.activeTask = taskControl;
         try {
@@ -3671,7 +3833,7 @@ function dispatchLatestByChat(chatRunners, taskKey, data, handler) {
       }
     } finally {
       runner.draining = false;
-      if (!runner.activeTask && !runner.pendingData) {
+      if (!runner.activeTask && runner.pendingQueue.length === 0) {
         chatRunners.delete(taskKey);
       }
     }
@@ -3796,7 +3958,8 @@ async function main() {
   const recentMentionedSenders = new Map();
 
   async function handleMessageEvent(data, taskControl = createChatTaskControl('')) {
-    const eventData = data || {};
+    const eventData = data?.eventData || data || {};
+    const dispatchMeta = data?.dispatchMeta || {};
     const senderOpenID = eventData?.sender?.sender_id?.open_id || '';
     const senderType = eventData?.sender?.sender_type || '';
     const message = eventData?.message || {};
@@ -3840,7 +4003,8 @@ async function main() {
       ? getRecentMentionState(recentMentionedSenders, chatID, senderOpenID, now)
       : null;
     const mentionMatchedByCarry = Boolean(
-      recentMentionState && (messageType === 'file' || messageType === 'image' || messageType === 'post' || messageType === 'audio')
+      dispatchMeta.allowMentionCarry
+      || (recentMentionState && isCarryEligibleMessageType(messageType))
     );
 
     console.log('FEISHU_EVENT');
@@ -3861,7 +4025,11 @@ async function main() {
       console.log(`mention_fallback=text_alias alias=${textMentionAlias}`);
     }
     if (mentionMatchedByCarry) {
-      console.log(`mention_fallback=recent_sender_window age_ms=${now - recentMentionState.timestamp}`);
+      if (recentMentionState?.timestamp) {
+        console.log(`mention_fallback=recent_sender_window age_ms=${now - recentMentionState.timestamp}`);
+      } else {
+        console.log('mention_fallback=queued_sender_window');
+      }
     }
 
     if (!chatID) {
@@ -4178,10 +4346,14 @@ async function main() {
         if (!echoReply) {
           throw new Error('echo reply empty');
         }
-        if (fakeStream.enabled) {
+        if (fakeStream.enabled && !shouldRenderFeishuMarkdown(echoReply)) {
           await sendTextReplyWithFakeStream(client, chatID, echoReply, fakeStream);
         } else {
-          await sendTextReply(client, chatID, echoReply);
+          await sendRenderedReply(client, chatID, echoReply, {
+            logTag: 'reply',
+            title: 'AI 回复',
+            preferMarkdown: true,
+          });
         }
       }
       if (replyMode === 'codex' && codex.historyTurns > 0) {
@@ -4238,14 +4410,20 @@ async function main() {
     loggerLevel: lark.LoggerLevel.info,
   }).register({
     'im.message.receive_v1': (data) => {
-      const message = data?.message || {};
-      const chatID = message.chat_id || 'unknown';
-      const chatType = message.chat_type || '';
-      const messageID = message.message_id || '';
-      const senderOpenID = data?.sender?.sender_id?.open_id || '';
-      const conversationScope = buildConversationScope(chatID, chatType, senderOpenID, messageID);
-      const taskKey = conversationScope.key || chatID || messageID || 'unknown';
-      dispatchLatestByChat(chatRunners, taskKey, data, handleMessageEvent);
+      const dispatchEnvelope = buildDispatchEnvelope(data, {
+        mentionAliases,
+        botOpenId: creds.botOpenId.value,
+        recentMentionedSenders,
+      });
+      dispatchLatestByChat(
+        chatRunners,
+        dispatchEnvelope.taskKey,
+        dispatchEnvelope.payload,
+        handleMessageEvent,
+        {
+          shouldSupersede: () => dispatchEnvelope.shouldSupersedeActiveTask,
+        }
+      );
     },
   });
 
