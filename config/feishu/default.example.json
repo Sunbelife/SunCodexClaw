@@ -43,5 +43,9 @@
     "language": "",
     "base_url": "https://api.openai.com/v1",
     "ffmpeg_bin": ""
+  },
+  "memory": {
+    "enabled": true,
+    "role_memory": ""
   }
 }

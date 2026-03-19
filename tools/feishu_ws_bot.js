@@ -33,6 +33,12 @@ const DEFAULT_CODEX_SYSTEM_PROMPT = [
   '不要承诺“稍后回复”或“几分钟后回复”；必须在当前这一条里给出可执行结果，或明确失败原因。',
   '默认使用简体中文，除非用户明确要求其他语言。',
 ].join('\n');
+const FORCE_EXECUTE_CODE_TASK_PROMPT = [
+  '用户这次是在要求你直接修改代码、排查问题或处理工程任务。',
+  '默认先查看代码并直接动手实现，不要只给方案，不要只口头答应。',
+  '优先完成文件修改、命令执行和必要验证，再回复结果。',
+  '回复时简洁说明改了什么、验证了什么、还剩什么风险。',
+].join('\n');
 const MAX_IMAGE_INPUTS = 6;
 const FEISHU_TEXT_CHUNK_LIMIT = 4000;
 const FEISHU_MARKDOWN_CARD_CHUNK_LIMIT = 4000;
@@ -70,6 +76,30 @@ const CONTENT_TYPE_EXTENSION_MAP = new Map([
   ['audio/opus', '.opus'],
   ['application/ogg', '.ogg'],
 ]);
+const REPO_DIR = path.resolve(__dirname, '..');
+const FEISHU_RUNTIME_DIR = path.join(REPO_DIR, '.runtime', 'feishu');
+const FEISHU_MEMORY_DIR = path.join(FEISHU_RUNTIME_DIR, 'memory');
+const FEISHU_MEMORY_HEADER = '<<SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
+const FEISHU_MEMORY_FOOTER = '<<END_SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
+const FEISHU_MEMORY_SCOPE_PROFILE = 'profile_facts';
+const FEISHU_MEMORY_SCOPE_ROLE = 'role_memory';
+const FEISHU_MEMORY_SCOPE_HISTORY = 'history';
+const FEISHU_MEMORY_SECTION_ACTIVATED_HISTORY = 'activated_history';
+const FEISHU_MEMORY_SECTION_RECENT_SUMMARY = 'recent_summary';
+const FEISHU_MEMORY_SECTION_LIVE_TOOL_FACTS = 'live_tool_facts';
+const FEISHU_MEMORY_MAX_SECTION_CHARS = 1200;
+const FEISHU_MEMORY_MAX_RENDERED_ITEMS = 10;
+const FEISHU_MEMORY_MAX_ITEM_CHARS = 180;
+const FEISHU_MEMORY_MAX_RECENT_TURNS = 4;
+const FEISHU_MEMORY_MAX_RECENT_TURN_CHARS = 120;
+const FEISHU_MEMORY_MAX_LIVE_TOOL_FACTS = 2;
+const FEISHU_MEMORY_MAX_LIVE_TOOL_FACT_CHARS = 180;
+const FEISHU_MEMORY_STORE_MAX_PROFILE_FACTS = 48;
+const FEISHU_MEMORY_STORE_MAX_ROLE_FACTS = 24;
+const FEISHU_MEMORY_STORE_MAX_HISTORY_ITEMS = 240;
+const FEISHU_MEMORY_STORE_MAX_RECENT_TURNS = 24;
+const FEISHU_MEMORY_STORE_MAX_LIVE_TOOL_FACTS = 24;
+const FEISHU_MEMORY_KEYWORD_PATTERN = /[\p{L}\p{N}]{2,12}/gu;
 
 function getArg(flag, fallback = '') {
   const idx = process.argv.indexOf(flag);
@@ -415,6 +445,19 @@ function resolveCodexConfig(config) {
     apiKeySource: apiKey.source,
     sandbox,
     approvalPolicy,
+  };
+}
+
+function resolveMemoryConfig(config) {
+  const memoryConfig = config.memory || {};
+  return {
+    enabled: asBool(getArg('--memory-enabled', process.env.FEISHU_MEMORY_ENABLED || memoryConfig.enabled), true),
+    roleMemory: String(
+      getArg(
+        '--memory-role-memory',
+        process.env.FEISHU_MEMORY_ROLE_MEMORY || memoryConfig.role_memory || memoryConfig.roleMemory || ''
+      )
+    ).trim(),
   };
 }
 
@@ -1439,6 +1482,50 @@ function resolveLocalFilePath(rawFilePath, cwd = '') {
   return path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(cwd || process.cwd(), raw);
 }
 
+function extractMarkdownLinkTarget(rawTarget) {
+  const target = String(rawTarget || '').trim();
+  if (!target) return '';
+  const angleWrapped = target.match(/^<([^>]+)>$/);
+  if (angleWrapped) return String(angleWrapped[1] || '').trim();
+  const plainTarget = target.match(/^(\S+?)(?:\s+["'][\s\S]*["'])?$/);
+  return plainTarget ? String(plainTarget[1] || '').trim() : target;
+}
+
+function resolveLocalMarkdownResourcePath(rawTarget, cwd = '') {
+  let target = extractMarkdownLinkTarget(rawTarget);
+  if (!target) return '';
+
+  if (/^file:\/\//i.test(target)) {
+    target = target.replace(/^file:\/\//i, '');
+    try {
+      target = decodeURIComponent(target);
+    } catch (_) {
+      // ignore malformed URI sequences and keep the raw path
+    }
+    if (/^\/[A-Za-z]:[\\/]/.test(target)) {
+      target = target.slice(1);
+    }
+  }
+
+  if (/^(https?:|mailto:|data:|#)/i.test(target)) return '';
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target) && !/^file:/i.test(target)) return '';
+  return resolveLocalFilePath(target, cwd);
+}
+
+function pushAttachmentCandidate(attachments, seen, type, targetPath) {
+  const normalizedType = type === 'image' ? 'image' : 'file';
+  const normalizedPath = String(targetPath || '').trim();
+  if (!normalizedPath) return false;
+  const dedupeKey = `${normalizedType}:${normalizedPath}`;
+  if (seen.has(dedupeKey)) return false;
+  seen.add(dedupeKey);
+  attachments.push({
+    type: normalizedType,
+    path: normalizedPath,
+  });
+  return true;
+}
+
 function extractFeishuAttachmentDirectives(rawText) {
   const lines = String(rawText || '').replace(/\r/g, '').split('\n');
   const attachments = [];
@@ -1509,6 +1596,566 @@ function buildDefaultAttachmentReply(attachments = []) {
   if (fileCount > 0 && imageCount === 0) return '文件已发送，请查收。';
   if (imageCount > 0 || fileCount > 0) return '附件已发送，请查收。';
   return '';
+}
+
+function shouldSendLocalFilesForRequest(rawText = '') {
+  const text = String(rawText || '').replace(/\s+/g, '').toLowerCase();
+  if (!text) return false;
+  return /(发我|发给我|给我发|把文件发|把附件发|附件|下载|导出|导给我|传给我|文件给我|要文件|sendmethefile|sendthefile|attachment|downloadfile|exportfile)/i.test(text);
+}
+
+function extractFeishuReplyResources(rawText, {
+  cwd = '',
+  preferFileAttachments = false,
+} = {}) {
+  const directivePlan = extractFeishuAttachmentDirectives(rawText);
+  const attachments = [];
+  const seen = new Set();
+
+  for (const attachment of directivePlan.attachments) {
+    const resolvedPath = resolveLocalFilePath(attachment.path, cwd) || String(attachment.path || '').trim();
+    pushAttachmentCandidate(attachments, seen, attachment.type, resolvedPath);
+  }
+
+  const lines = String(directivePlan.text || '').replace(/\r/g, '').split('\n');
+  const cleanedLines = [];
+  let inCodeFence = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^```/.test(trimmed)) {
+      inCodeFence = !inCodeFence;
+      cleanedLines.push(line);
+      continue;
+    }
+
+    if (inCodeFence) {
+      cleanedLines.push(line);
+      continue;
+    }
+
+    let nextLine = line;
+    nextLine = nextLine.replace(/!\[([^\]]*)]\(([^)\n]+)\)/g, (full, alt, rawTarget) => {
+      const localPath = resolveLocalMarkdownResourcePath(rawTarget, cwd);
+      if (!localPath) return full;
+      pushAttachmentCandidate(attachments, seen, 'image', localPath);
+      const altText = String(alt || '').trim();
+      if (!altText || /^(image|图片)$/i.test(altText)) return '';
+      return altText;
+    });
+    nextLine = nextLine.replace(/\[([^\]]+)]\(([^)\n]+)\)/g, (full, label, rawTarget) => {
+      const localPath = resolveLocalMarkdownResourcePath(rawTarget, cwd);
+      if (!localPath) return full;
+      const resourceType = isImageFilePath(localPath) ? 'image' : 'file';
+      if (resourceType === 'image' || preferFileAttachments) {
+        pushAttachmentCandidate(attachments, seen, resourceType, localPath);
+      }
+      const fallbackLabel = sanitizeLocalFileName(path.basename(localPath), '附件');
+      const rawLabel = String(label || '').trim();
+      const displayLabel = /^(?:~\/|\.\.?\/|\/)/.test(rawLabel) ? fallbackLabel : rawLabel;
+      return displayLabel || fallbackLabel;
+    });
+    cleanedLines.push(nextLine);
+  }
+
+  return {
+    text: cleanedLines
+      .join('\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim(),
+    attachments,
+  };
+}
+
+function cleanMemoryText(raw) {
+  let text = String(raw || '').replace(/\r/g, '\n');
+  if (!text.trim()) return '';
+  text = text.replace(/\[\[FEISHU_SEND_(?:FILE|IMAGE):[^\]]+]]/gi, ' ');
+  text = text.replace(/```[\s\S]*?```/g, ' [代码] ');
+  text = text.replace(/`[^`\n]+`/g, ' [代码] ');
+  text = text.replace(/!\[([^\]]*)]\(([^)]+)\)/g, ' $1 ');
+  text = text.replace(/\[([^\]]+)]\(([^)]+)\)/g, ' $1 ');
+  text = text.replace(/(^|[\s(])((?:~\/|\.\.?\/|\/(?:[^\/\s)]+\/)+)[^\s)]+)/g, '$1<path>');
+  text = text.replace(/https?:\/\/\S+/gi, '<url>');
+  text = text.replace(/\s+/g, ' ').trim();
+  return text;
+}
+
+function clampMemoryText(raw, maxLength = FEISHU_MEMORY_MAX_ITEM_CHARS) {
+  return compactText(cleanMemoryText(raw), maxLength);
+}
+
+function normalizeMemoryKey(raw) {
+  return cleanMemoryText(raw).toLowerCase();
+}
+
+function extractMemoryKeywords(raw) {
+  const text = cleanMemoryText(raw);
+  if (!text) return '';
+  const matches = text.match(FEISHU_MEMORY_KEYWORD_PATTERN) || [];
+  return uniqueStrings(matches.map((item) => String(item || '').toLowerCase())).slice(0, 12).join(',');
+}
+
+function normalizeMemoryScope(rawScope) {
+  const scope = String(rawScope || '').trim();
+  if (scope === FEISHU_MEMORY_SCOPE_PROFILE) return scope;
+  if (scope === FEISHU_MEMORY_SCOPE_ROLE) return scope;
+  return FEISHU_MEMORY_SCOPE_HISTORY;
+}
+
+function normalizeMemoryItem(rawItem, fallbackScope = FEISHU_MEMORY_SCOPE_HISTORY) {
+  const base = rawItem && typeof rawItem === 'object' ? rawItem : {};
+  const scope = normalizeMemoryScope(base.scope || fallbackScope);
+  const content = clampMemoryText(base.content || base.summary, FEISHU_MEMORY_MAX_ITEM_CHARS);
+  const summary = clampMemoryText(base.summary || base.content, FEISHU_MEMORY_MAX_ITEM_CHARS);
+  if (!content && !summary) return null;
+  const now = Date.now();
+  const dedupeSeed = base.dedupeKey || `${scope}|${summary || content}`;
+  return {
+    scope,
+    memoryType: clampMemoryText(base.memoryType || '', 40),
+    content: content || summary,
+    summary: summary || content,
+    keywords: clampMemoryText(base.keywords || extractMemoryKeywords(`${summary} ${content}`), 120),
+    source: clampMemoryText(base.source || '', 80),
+    dedupeKey: normalizeMemoryKey(dedupeSeed),
+    importance: asInt(base.importance, 70, 0, 100),
+    confidence: asInt(base.confidence, 80, 0, 100),
+    hitCount: asInt(base.hitCount, 1, 1, 1000000),
+    createdAt: asInt(base.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: asInt(base.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function compareMemoryItems(a, b) {
+  if ((a?.importance || 0) !== (b?.importance || 0)) return (b?.importance || 0) - (a?.importance || 0);
+  if ((a?.hitCount || 0) !== (b?.hitCount || 0)) return (b?.hitCount || 0) - (a?.hitCount || 0);
+  return (b?.updatedAt || 0) - (a?.updatedAt || 0);
+}
+
+function upsertMemoryItem(list, rawItem, limit) {
+  const item = normalizeMemoryItem(rawItem, rawItem?.scope);
+  if (!item) return null;
+  const items = Array.isArray(list) ? list : [];
+  const now = Date.now();
+  const idx = items.findIndex((entry) => normalizeMemoryKey(entry?.dedupeKey || '') === item.dedupeKey);
+  if (idx >= 0) {
+    const prev = normalizeMemoryItem(items[idx], item.scope) || item;
+    const mergedKeywords = uniqueStrings([
+      ...String(prev.keywords || '').split(','),
+      ...String(item.keywords || '').split(','),
+    ].map((part) => part.trim()).filter(Boolean)).join(',');
+    items[idx] = {
+      ...prev,
+      ...item,
+      keywords: mergedKeywords,
+      importance: Math.max(prev.importance || 0, item.importance || 0),
+      confidence: Math.max(prev.confidence || 0, item.confidence || 0),
+      hitCount: Math.max(1, (prev.hitCount || 1) + 1),
+      createdAt: prev.createdAt || now,
+      updatedAt: now,
+    };
+  } else {
+    items.push({
+      ...item,
+      createdAt: item.createdAt || now,
+      updatedAt: now,
+    });
+  }
+  items.sort(compareMemoryItems);
+  while (items.length > limit) items.pop();
+  return idx >= 0 ? items[idx] : items[items.length - 1];
+}
+
+function normalizeRecentTurn(rawTurn) {
+  const turn = rawTurn && typeof rawTurn === 'object' ? rawTurn : {};
+  const role = String(turn.role || '').trim().toLowerCase() === 'assistant' ? 'assistant' : 'user';
+  const text = clampMemoryText(turn.text, FEISHU_MEMORY_MAX_RECENT_TURN_CHARS);
+  if (!text) return null;
+  return {
+    role,
+    text,
+    threadId: clampMemoryText(turn.threadId || '', 40),
+    at: asInt(turn.at, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function pushRecentTurn(turns, rawTurn, limit = FEISHU_MEMORY_STORE_MAX_RECENT_TURNS) {
+  const nextTurn = normalizeRecentTurn(rawTurn);
+  if (!nextTurn) return null;
+  const list = Array.isArray(turns) ? turns : [];
+  const last = list[list.length - 1];
+  if (last && last.role === nextTurn.role && last.text === nextTurn.text) {
+    last.at = nextTurn.at;
+    last.threadId = nextTurn.threadId || last.threadId;
+    return last;
+  }
+  list.push(nextTurn);
+  while (list.length > limit) list.shift();
+  return nextTurn;
+}
+
+function normalizeLiveToolFact(rawFact) {
+  const fact = rawFact && typeof rawFact === 'object' ? rawFact : { text: rawFact };
+  const text = clampMemoryText(fact.text, FEISHU_MEMORY_MAX_LIVE_TOOL_FACT_CHARS);
+  if (!text) return null;
+  return {
+    text,
+    at: asInt(fact.at, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function pushLiveToolFact(facts, rawFact, limit = FEISHU_MEMORY_STORE_MAX_LIVE_TOOL_FACTS) {
+  const nextFact = normalizeLiveToolFact(rawFact);
+  if (!nextFact) return null;
+  const list = Array.isArray(facts) ? facts : [];
+  const last = list[list.length - 1];
+  if (last && last.text === nextFact.text) {
+    last.at = nextFact.at;
+    return last;
+  }
+  list.push(nextFact);
+  while (list.length > limit) list.shift();
+  return nextFact;
+}
+
+function botMemoryStorePath(accountName) {
+  const safeAccount = sanitizeLocalFileName(String(accountName || 'default').trim() || 'default', 'default');
+  return path.join(FEISHU_MEMORY_DIR, `${safeAccount}.json`);
+}
+
+function createEmptyBotMemoryStore(accountName) {
+  return {
+    version: 1,
+    accountName: String(accountName || 'default').trim() || 'default',
+    updatedAt: Date.now(),
+    profileFacts: [],
+    roleMemoryItems: [],
+    historyItems: [],
+    recentTurns: [],
+    liveToolFacts: [],
+  };
+}
+
+function normalizeBotMemoryStore(accountName, rawStore) {
+  const base = rawStore && typeof rawStore === 'object' ? rawStore : {};
+  const empty = createEmptyBotMemoryStore(accountName);
+  return {
+    version: 1,
+    accountName: String(base.accountName || empty.accountName).trim() || empty.accountName,
+    updatedAt: asInt(base.updatedAt, Date.now(), 0, Number.MAX_SAFE_INTEGER),
+    profileFacts: Array.isArray(base.profileFacts)
+      ? base.profileFacts.map((item) => normalizeMemoryItem(item, FEISHU_MEMORY_SCOPE_PROFILE)).filter(Boolean).sort(compareMemoryItems).slice(0, FEISHU_MEMORY_STORE_MAX_PROFILE_FACTS)
+      : [],
+    roleMemoryItems: Array.isArray(base.roleMemoryItems)
+      ? base.roleMemoryItems.map((item) => normalizeMemoryItem(item, FEISHU_MEMORY_SCOPE_ROLE)).filter(Boolean).sort(compareMemoryItems).slice(0, FEISHU_MEMORY_STORE_MAX_ROLE_FACTS)
+      : [],
+    historyItems: Array.isArray(base.historyItems)
+      ? base.historyItems.map((item) => normalizeMemoryItem(item, FEISHU_MEMORY_SCOPE_HISTORY)).filter(Boolean).sort(compareMemoryItems).slice(0, FEISHU_MEMORY_STORE_MAX_HISTORY_ITEMS)
+      : [],
+    recentTurns: Array.isArray(base.recentTurns)
+      ? base.recentTurns.map((item) => normalizeRecentTurn(item)).filter(Boolean).slice(-FEISHU_MEMORY_STORE_MAX_RECENT_TURNS)
+      : [],
+    liveToolFacts: Array.isArray(base.liveToolFacts)
+      ? base.liveToolFacts.map((item) => normalizeLiveToolFact(item)).filter(Boolean).slice(-FEISHU_MEMORY_STORE_MAX_LIVE_TOOL_FACTS)
+      : [],
+  };
+}
+
+function syncRoleMemoryTextIntoStore(store, roleMemoryText = '') {
+  const nextStore = normalizeBotMemoryStore(store?.accountName || 'default', store);
+  const retained = nextStore.roleMemoryItems.filter((item) => item.source !== 'config_role_memory');
+  nextStore.roleMemoryItems = retained;
+
+  const lines = uniqueStrings(
+    String(roleMemoryText || '')
+      .replace(/\r/g, '\n')
+      .split('\n')
+      .map((line) => line.replace(/^\s*(?:[-*•]|\d+[\.\)、:：-])\s*/, ''))
+      .map((line) => clampMemoryText(line, FEISHU_MEMORY_MAX_ITEM_CHARS))
+      .filter(Boolean)
+  );
+  for (const line of lines) {
+    upsertMemoryItem(nextStore.roleMemoryItems, {
+      scope: FEISHU_MEMORY_SCOPE_ROLE,
+      memoryType: 'role_memory',
+      content: line,
+      summary: line,
+      source: 'config_role_memory',
+      importance: 90,
+      confidence: 95,
+    }, FEISHU_MEMORY_STORE_MAX_ROLE_FACTS);
+  }
+  nextStore.roleMemoryItems.sort(compareMemoryItems);
+  return nextStore;
+}
+
+function readBotMemoryStore(accountName, roleMemoryText = '') {
+  const filePath = botMemoryStorePath(accountName);
+  const loaded = readJsonIfExists(filePath) || createEmptyBotMemoryStore(accountName);
+  const store = syncRoleMemoryTextIntoStore(normalizeBotMemoryStore(accountName, loaded), roleMemoryText);
+  return { filePath, store };
+}
+
+function writeBotMemoryStore(accountName, store) {
+  const filePath = botMemoryStorePath(accountName);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const normalized = normalizeBotMemoryStore(accountName, store);
+  fs.writeFileSync(filePath, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  return filePath;
+}
+
+const botMemoryWriteQueues = new Map();
+
+function queueBotMemoryWrite(accountName, task) {
+  const key = String(accountName || 'default').trim() || 'default';
+  const previous = botMemoryWriteQueues.get(key) || Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(task);
+  const tracked = next.finally(() => {
+    if (botMemoryWriteQueues.get(key) === tracked) {
+      botMemoryWriteQueues.delete(key);
+    }
+  });
+  botMemoryWriteQueues.set(key, tracked);
+  return tracked;
+}
+
+function updateBotMemoryStore(accountName, roleMemoryText, updater) {
+  return queueBotMemoryWrite(accountName, async () => {
+    const loaded = readBotMemoryStore(accountName, roleMemoryText);
+    const currentStore = loaded.store;
+    const nextStore = typeof updater === 'function'
+      ? await Promise.resolve(updater(currentStore))
+      : currentStore;
+    const normalized = syncRoleMemoryTextIntoStore(
+      normalizeBotMemoryStore(accountName, nextStore || currentStore),
+      roleMemoryText
+    );
+    normalized.updatedAt = Date.now();
+    writeBotMemoryStore(accountName, normalized);
+    return normalized;
+  });
+}
+
+function buildRecentSummaryText(recentTurns = []) {
+  const turns = Array.isArray(recentTurns) ? recentTurns.filter(Boolean).slice(-FEISHU_MEMORY_MAX_RECENT_TURNS) : [];
+  if (turns.length === 0) return '';
+  return turns
+    .map((turn) => `${turn.role === 'assistant' ? '助手' : '用户'}：${clampMemoryText(turn.text, FEISHU_MEMORY_MAX_RECENT_TURN_CHARS)}`)
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildLiveToolFactsText(liveToolFacts = []) {
+  const facts = Array.isArray(liveToolFacts) ? liveToolFacts.filter(Boolean).slice(-FEISHU_MEMORY_MAX_LIVE_TOOL_FACTS) : [];
+  if (facts.length === 0) return '';
+  return facts
+    .map((fact) => clampMemoryText(fact.text, FEISHU_MEMORY_MAX_LIVE_TOOL_FACT_CHARS))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function extractProfileFactCandidates(rawText = '') {
+  const lines = String(rawText || '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => clampMemoryText(line, FEISHU_MEMORY_MAX_ITEM_CHARS))
+    .filter(Boolean);
+  const facts = [];
+  for (const line of lines) {
+    if (line.length < 6) continue;
+    if (/^\/(?:thread|threads|reset)\b/i.test(line)) continue;
+    if (/^(?:图片|文件|附件)已发送，请查收/.test(line)) continue;
+    if (
+      /(喜欢|不喜欢|偏好|习惯|不要|记得|默认|以后|下次|直接|通过飞书|存储到本地|独立记忆|跨线程|共享记忆|附件|文件发我|图片发我|简洁|详细)/.test(line)
+      || /^(?:我|用户).*(?:住在|在.*工作|在.*上班|来自|叫|习惯|喜欢|不喜欢|偏好)/.test(line)
+    ) {
+      facts.push(line);
+    }
+  }
+  return uniqueStrings(facts).slice(0, 6);
+}
+
+function buildHistoryTurnSummary(userText = '', assistantText = '') {
+  const user = clampMemoryText(userText, 110);
+  const assistant = clampMemoryText(assistantText, 110);
+  if (!user) return '';
+  if (!assistant) return `用户：${user}`;
+  const normalizedAssistant = /^(?:图片|文件|附件)已发送，请查收/.test(assistant)
+    ? '已发送所需附件'
+    : assistant;
+  return compactText(`用户：${user}；助手：${normalizedAssistant}`, FEISHU_MEMORY_MAX_ITEM_CHARS);
+}
+
+function scoreMemoryItemForQuery(item, queryText = '') {
+  const memory = normalizeMemoryItem(item, item?.scope);
+  if (!memory) return 0;
+  const haystack = `${memory.summary}\n${memory.content}\n${memory.keywords}`.toLowerCase();
+  const normalizedQuery = cleanMemoryText(queryText).toLowerCase();
+  const queryKeywords = uniqueStrings((normalizedQuery.match(FEISHU_MEMORY_KEYWORD_PATTERN) || []).map((part) => String(part || '').toLowerCase()));
+  let score = (memory.importance || 0) + Math.min(18, memory.hitCount || 0);
+  const ageMs = Math.max(0, Date.now() - (memory.updatedAt || 0));
+  if (ageMs < 7 * 24 * 60 * 60 * 1000) score += 8;
+  if (ageMs < 24 * 60 * 60 * 1000) score += 6;
+
+  if (!normalizedQuery) return score;
+  if (haystack.includes(normalizedQuery)) score += 40;
+  for (const keyword of queryKeywords) {
+    if (!keyword) continue;
+    if (haystack.includes(keyword)) score += keyword.length >= 4 ? 18 : 10;
+  }
+  if (/(记得|上次|之前|前面|曾经|偏好|喜欢|不喜欢|习惯)/.test(normalizedQuery)) {
+    score += 8;
+  }
+  return score;
+}
+
+function selectMemoryItems(items = [], queryText = '', limit = FEISHU_MEMORY_MAX_RENDERED_ITEMS, options = {}) {
+  const { requireQuery = false, minScore = 0 } = options || {};
+  const normalizedQuery = cleanMemoryText(queryText);
+  if (requireQuery && !normalizedQuery) return [];
+  const scored = (Array.isArray(items) ? items : [])
+    .map((item) => ({ item, score: scoreMemoryItemForQuery(item, normalizedQuery) }))
+    .filter((entry) => entry.score >= minScore)
+    .sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      return compareMemoryItems(a.item, b.item);
+    });
+  return scored.slice(0, limit).map((entry) => entry.item);
+}
+
+function renderMemoryItems(items = [], limit = FEISHU_MEMORY_MAX_RENDERED_ITEMS, maxChars = FEISHU_MEMORY_MAX_SECTION_CHARS) {
+  const lines = [];
+  for (const item of (Array.isArray(items) ? items : []).slice(0, limit)) {
+    const line = clampMemoryText(item?.summary || item?.content, FEISHU_MEMORY_MAX_ITEM_CHARS);
+    if (!line) continue;
+    const nextText = [...lines, line].join('\n');
+    if (nextText.length > maxChars) break;
+    lines.push(line);
+  }
+  return lines.join('\n');
+}
+
+function renderMemoryBundle(bundle) {
+  const sections = [
+    { name: FEISHU_MEMORY_SCOPE_PROFILE, content: bundle?.profileFacts || '' },
+    { name: FEISHU_MEMORY_SCOPE_ROLE, content: bundle?.roleMemory || '' },
+    { name: FEISHU_MEMORY_SECTION_RECENT_SUMMARY, content: bundle?.recentSummary || '' },
+    { name: FEISHU_MEMORY_SECTION_ACTIVATED_HISTORY, content: bundle?.activatedHistory || '' },
+    { name: FEISHU_MEMORY_SECTION_LIVE_TOOL_FACTS, content: bundle?.liveToolFacts || '' },
+  ].filter((section) => String(section.content || '').trim());
+
+  if (sections.length === 0) return '';
+  const body = sections
+    .map((section) => `[${section.name}]\n${section.content}\n[/${section.name}]`)
+    .join('\n');
+  return `${FEISHU_MEMORY_HEADER}\n${body}\n${FEISHU_MEMORY_FOOTER}`.trim();
+}
+
+function buildBotMemoryBundle(store, queryText = '') {
+  const memoryStore = normalizeBotMemoryStore(store?.accountName || 'default', store);
+  return {
+    profileFacts: renderMemoryItems(
+      selectMemoryItems(memoryStore.profileFacts, queryText, 6, { minScore: 0 }),
+      6,
+      FEISHU_MEMORY_MAX_SECTION_CHARS
+    ),
+    roleMemory: renderMemoryItems(
+      selectMemoryItems(memoryStore.roleMemoryItems, queryText, 4, { minScore: 0 }),
+      4,
+      FEISHU_MEMORY_MAX_SECTION_CHARS
+    ),
+    recentSummary: compactText(buildRecentSummaryText(memoryStore.recentTurns), FEISHU_MEMORY_MAX_SECTION_CHARS),
+    activatedHistory: renderMemoryItems(
+      selectMemoryItems(memoryStore.historyItems, queryText, 6, { requireQuery: true, minScore: 78 }),
+      6,
+      FEISHU_MEMORY_MAX_SECTION_CHARS
+    ),
+    liveToolFacts: compactText(buildLiveToolFactsText(memoryStore.liveToolFacts), FEISHU_MEMORY_MAX_SECTION_CHARS),
+  };
+}
+
+function buildBotMemoryBundleText(store, queryText = '') {
+  return renderMemoryBundle(buildBotMemoryBundle(store, queryText));
+}
+
+function deriveMemoryLiveToolFacts({ sent = [], failed = [] } = {}) {
+  const facts = [];
+  const sentImages = (Array.isArray(sent) ? sent : []).filter((item) => item.type === 'image');
+  const sentFiles = (Array.isArray(sent) ? sent : []).filter((item) => item.type === 'file');
+  if (sentImages.length > 0) {
+    facts.push(`已发送图片：${sentImages.map((item) => item.fileName).join('，')}`);
+  }
+  if (sentFiles.length > 0) {
+    facts.push(`已发送文件：${sentFiles.map((item) => item.fileName).join('，')}`);
+  }
+  if ((Array.isArray(failed) ? failed : []).length > 0) {
+    facts.push(`附件发送失败：${failed.map((item) => item.fileName).join('，')}`);
+  }
+  return facts.map((fact) => clampMemoryText(fact, FEISHU_MEMORY_MAX_LIVE_TOOL_FACT_CHARS)).filter(Boolean);
+}
+
+function recordConversationIntoBotMemoryStore(store, {
+  userText = '',
+  assistantText = '',
+  liveToolFacts = [],
+  threadId = '',
+} = {}) {
+  const nextStore = normalizeBotMemoryStore(store?.accountName || 'default', store);
+
+  if (userText) {
+    pushRecentTurn(nextStore.recentTurns, {
+      role: 'user',
+      text: userText,
+      threadId,
+      at: Date.now(),
+    });
+  }
+  if (assistantText) {
+    pushRecentTurn(nextStore.recentTurns, {
+      role: 'assistant',
+      text: assistantText,
+      threadId,
+      at: Date.now(),
+    });
+  }
+
+  const historySummary = buildHistoryTurnSummary(userText, assistantText);
+  if (historySummary) {
+    upsertMemoryItem(nextStore.historyItems, {
+      scope: FEISHU_MEMORY_SCOPE_HISTORY,
+      memoryType: 'history_fact',
+      content: historySummary,
+      summary: historySummary,
+      source: 'conversation_turn',
+      importance: 62,
+      confidence: 82,
+    }, FEISHU_MEMORY_STORE_MAX_HISTORY_ITEMS);
+  }
+
+  const profileFacts = extractProfileFactCandidates(userText);
+  for (const fact of profileFacts) {
+    const importance = /(通过飞书|存储到本地|默认|记得|不要|直接|独立记忆|跨线程|共享记忆)/.test(fact) ? 95 : 84;
+    upsertMemoryItem(nextStore.profileFacts, {
+      scope: FEISHU_MEMORY_SCOPE_PROFILE,
+      memoryType: 'profile_fact',
+      content: fact,
+      summary: fact,
+      source: 'conversation_profile',
+      importance,
+      confidence: 90,
+    }, FEISHU_MEMORY_STORE_MAX_PROFILE_FACTS);
+  }
+
+  for (const fact of Array.isArray(liveToolFacts) ? liveToolFacts : []) {
+    pushLiveToolFact(nextStore.liveToolFacts, { text: fact }, FEISHU_MEMORY_STORE_MAX_LIVE_TOOL_FACTS);
+  }
+
+  nextStore.updatedAt = Date.now();
+  return nextStore;
 }
 
 function getHeaderValue(headers, targetKey) {
@@ -2138,6 +2785,32 @@ function buildCodexThreadTitle({ botName = '', localThreadName = '', userText = 
   return [botLabel, threadLabel, userLabel].filter(Boolean).join(' | ');
 }
 
+function renderPromptHistory(history = []) {
+  const items = Array.isArray(history) ? history.slice(-8) : [];
+  if (items.length === 0) return '';
+  return items
+    .map((item) => {
+      const role = String(item?.role || '').trim().toLowerCase() === 'assistant' ? '助手' : '用户';
+      const text = compactText(String(item?.text || '').trim(), 320);
+      if (!text) return '';
+      return `${role}：${text}`;
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function buildFeishuReplyInstructions() {
+  return [
+    '回复要求：',
+    '1. 直接输出给用户的最终回复正文，不要加空话，不要承诺稍后回复。',
+    '2. 如果需要把本机图片发给用户，请单独占行输出 [[FEISHU_SEND_IMAGE:/绝对或相对路径]]。',
+    '3. 如果用户明确要文件，请单独占行输出 [[FEISHU_SEND_FILE:/绝对或相对路径]]，不要只给本地链接。',
+    '4. 除附件指令外，其他文字都会原样发送给飞书。',
+    `5. 发送图片前请确认文件真实存在、格式受支持且不超过 ${formatBytes(FEISHU_IMAGE_UPLOAD_LIMIT)}。`,
+    `6. 发送文件前请确认文件真实存在、不是目录且不超过 ${formatBytes(FEISHU_FILE_UPLOAD_LIMIT)}。`,
+  ].join('\n');
+}
+
 let cachedCodexStateDbPath = '';
 
 function resolveCodexStateDbPath() {
@@ -2249,68 +2922,85 @@ function buildCodexPrompt({
   cwd = '',
   addDirs = [],
   threadTitle = '',
+  forceExecution = false,
+  memoryBundleText = '',
 }) {
   const lines = [];
-  const title = String(threadTitle || '').trim();
-  if (title) {
-    lines.push(title);
+  const message = compactText(String(userText || ''), 2400);
+  const renderedHistory = renderPromptHistory(history);
+  if (forceExecution) {
+    lines.push(FORCE_EXECUTE_CODE_TASK_PROMPT);
     lines.push('');
   }
   lines.push(systemPrompt || DEFAULT_CODEX_SYSTEM_PROMPT);
+  if (threadTitle) {
+    lines.push('');
+    lines.push(`当前线程：${threadTitle}`);
+  }
   lines.push('');
   lines.push(`当前工作目录：${cwd || process.cwd()}`);
   if (Array.isArray(addDirs) && addDirs.length > 0) {
-    lines.push('额外可访问工作目录：');
-    for (const dir of addDirs) {
-      lines.push(`- ${dir}`);
-    }
+    lines.push(`额外可访问目录：${addDirs.join(' | ')}`);
+  }
+  if (memoryBundleText) {
+    lines.push('');
+    lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
+    lines.push(memoryBundleText);
   }
   lines.push('');
-  lines.push('对话上下文（按时间顺序，可能为空）：');
-  if (!history || history.length === 0) {
-    lines.push('(无)');
-  } else {
-    for (const item of history) {
-      const roleLabel = item.role === 'assistant' ? '助手' : '用户';
-      lines.push(`[${roleLabel}] ${compactText(item.text, 1200)}`);
-    }
-  }
+  lines.push('当前线程近期上下文：');
+  lines.push(renderedHistory || '(无)');
   lines.push('');
   lines.push('用户最新消息：');
-  lines.push(compactText(userText, 2000));
+  lines.push(message || '(空)');
   if (imageCount > 0) {
     lines.push(`附加图片：${imageCount} 张（请结合图片内容回答）。`);
   }
   lines.push('');
-  lines.push('请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原文。');
-  lines.push('禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。');
-  lines.push('如果 SSH、curl、nc 或其他网络命令失败，不要直接归因于“当前会话不能联网”或“网络策略拦截”。先报告原始报错，再用更小的连通性探测复核后再下结论。');
-  lines.push(`如果你需要机器人把本机图片直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
-  lines.push(`如果你需要机器人把本机文件直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
-  lines.push('可以输出多行，每行一个附件。除这些指令外，其他文字都会作为正常回复发送给用户。');
-  lines.push(`发送图片前请确认文件真实存在、格式受支持，且大小不超过 ${formatBytes(FEISHU_IMAGE_UPLOAD_LIMIT)}。`);
-  lines.push(`发送文件前请确认文件真实存在、不是目录，且大小不超过 ${formatBytes(FEISHU_FILE_UPLOAD_LIMIT)}。`);
-  lines.push('如果用户发送了文件，消息正文里会给出本地临时文件路径；需要时请直接读取该文件。');
-  return lines.join('\n');
+  lines.push(buildFeishuReplyInstructions());
+  if (cwd) {
+    lines.push('如果用户发送了文件，消息正文里会给出本地临时路径；需要时请直接读取该文件。');
+  }
+  return lines.join('\n').trim();
 }
 
-function buildCodexResumePrompt({ userText, imageCount = 0 }) {
+function buildCodexResumePrompt({
+  userText,
+  imageCount = 0,
+  forceExecution = false,
+  memoryBundleText = '',
+}) {
   const lines = [];
-  lines.push('继续当前线程。下面是用户最新消息，请直接回复用户。');
+  const message = compactText(String(userText || ''), 2400);
+  if (forceExecution) {
+    lines.push(FORCE_EXECUTE_CODE_TASK_PROMPT);
+    lines.push('');
+  }
+  lines.push('继续当前线程，直接回复用户。');
+  if (memoryBundleText) {
+    lines.push('');
+    lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
+    lines.push(memoryBundleText);
+  }
   lines.push('');
   lines.push('用户最新消息：');
-  lines.push(compactText(userText, 2000));
+  lines.push(message || '(空)');
   if (imageCount > 0) {
     lines.push(`附加图片：${imageCount} 张（请结合图片内容回答）。`);
   }
   lines.push('');
-  lines.push('请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原文。');
-  lines.push('禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。');
-  lines.push('如果 SSH、curl、nc 或其他网络命令失败，不要直接归因于“当前会话不能联网”或“网络策略拦截”。先报告原始报错，再用更小的连通性探测复核后再下结论。');
-  lines.push(`如果你需要机器人把本机图片直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
-  lines.push(`如果你需要机器人把本机文件直接发给用户，请在回复中单独占行输出：${FEISHU_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]`);
-  lines.push('可以输出多行，每行一个附件。除这些指令外，其他文字都会作为正常回复发送给用户。');
-  return lines.join('\n');
+  lines.push(buildFeishuReplyInstructions());
+  return lines.join('\n').trim();
+}
+
+function shouldForceCodexExecution(rawText = '') {
+  const text = String(rawText || '').trim();
+  if (!text) return false;
+  if (/\.(c|cc|cpp|h|hpp|m|mm|swift|go|py|js|jsx|ts|tsx|java|kt|rb|rs|php|sh|json|ya?ml|toml|sql|md)\b/i.test(text)) {
+    return true;
+  }
+  if (/`[^`\n]+`/.test(text)) return true;
+  return /(改代码|改程序|修改代码|修代码|修一下|修复|修正|排查|定位问题|找原因|加个|增加|补上|实现|支持|处理一下|优化|重构|删掉|删除|替换|更新配置|改配置|写脚本|脚本|命令|编译|构建|打包|部署|发布|刷机|烧录|固件|接口|版本号|回滚|迁移|测试一下|bug|fix|debug|implement|refactor|patch|compile|build|deploy|release|rollback|hotfix|config|firmware)/i.test(text);
 }
 
 function shouldBypassCodexSandbox(sandbox, approvalPolicy) {
@@ -2475,6 +3165,8 @@ async function generateCodexReply({
   imagePaths = [],
   sessionId = '',
   threadTitle = '',
+  forceExecution = false,
+  memoryBundleText = '',
   onSpawn = null,
   onProgressEvent = null,
 }) {
@@ -2516,7 +3208,7 @@ async function generateCodexReply({
   if (resolvedSessionId) {
     try {
       const resumed = await runExec({
-        prompt: buildCodexResumePrompt({ userText, imageCount }),
+        prompt: buildCodexResumePrompt({ userText, imageCount, forceExecution, memoryBundleText }),
         resumeSessionId: resolvedSessionId,
       });
       return {
@@ -2537,6 +3229,8 @@ async function generateCodexReply({
       cwd: codex.cwd,
       addDirs: codex.addDirs,
       threadTitle,
+      forceExecution,
+      memoryBundleText,
     }),
   });
 
@@ -3851,6 +4545,7 @@ async function main() {
 
   const creds = resolveCredentials(config);
   const codex = resolveCodexConfig(config);
+  const memory = resolveMemoryConfig(config);
   const speech = resolveSpeechConfig(config, codex);
   const codexDetect = detectCodex(codex.bin);
   const mentionAliases = resolveMentionAliases({
@@ -3916,6 +4611,9 @@ async function main() {
     console.log(`codex_bypass_sandbox=${shouldBypassCodexSandbox(codex.sandbox, codex.approvalPolicy) ? 'true' : 'false'}`);
     console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
     console.log(`codex_history_turns=${codex.historyTurns}`);
+    console.log(`memory_enabled=${memory.enabled ? 'true' : 'false'}`);
+    console.log(`memory_role_memory_chars=${memory.roleMemory.length}`);
+    if (memory.enabled) console.log(`memory_store=${botMemoryStorePath(accountName)}`);
     console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
     console.log(`speech_api_key_found=${speech.apiKey ? 'true' : 'false'}`);
     if (speech.apiKeySource) console.log(`speech_api_key_source=${speech.apiKeySource}`);
@@ -4211,6 +4909,13 @@ async function main() {
       }
     }
 
+    const memoryBundleText = replyMode === 'codex' && memory.enabled
+      ? buildBotMemoryBundleText(
+        readBotMemoryStore(accountName, memory.roleMemory).store,
+        historyUserText || userText
+      )
+      : '';
+
     const progressReporter = replyMode === 'codex' && progress.enabled
       ? createProgressReporter({
         client,
@@ -4245,12 +4950,15 @@ async function main() {
       taskControl.throwIfCancelled();
 
       let replyText = '';
+      let memoryLiveToolFacts = [];
       if (replyMode === 'codex') {
         const currentThread = getCurrentThread(chatState);
         if (!currentThread) {
           throw new Error('current thread not found');
         }
         const history = currentThread.history || [];
+        const forceExecution = shouldForceCodexExecution(historyUserText || userText);
+        console.log(`codex_force_execution=${forceExecution ? 'true' : 'false'}`);
         const codexThreadTitle = buildCodexThreadTitle({
           botName: botName || accountName,
           localThreadName: currentThread.name || currentThread.id,
@@ -4263,6 +4971,8 @@ async function main() {
           imagePaths,
           sessionId: currentThread.codexThreadId,
           threadTitle: codexThreadTitle,
+          forceExecution,
+          memoryBundleText,
           onSpawn: (child) => {
             taskControl.attachCodexChild(child);
           },
@@ -4291,7 +5001,10 @@ async function main() {
       }
       const codexRawReply = String(replyText || '').replace(/\r/g, '');
       if (replyMode === 'codex') {
-        const attachmentPlan = extractFeishuAttachmentDirectives(codexRawReply);
+        const attachmentPlan = extractFeishuReplyResources(codexRawReply, {
+          cwd: codex.cwd || process.cwd(),
+          preferFileAttachments: shouldSendLocalFilesForRequest(historyUserText || userText),
+        });
         let userReplyText = attachmentPlan.text;
         if (!userReplyText.trim() && attachmentPlan.attachments.length === 0) {
           throw new Error('codex returned empty reply');
@@ -4308,6 +5021,7 @@ async function main() {
           codex.cwd || process.cwd(),
           () => !taskControl.isCancelled()
         );
+        memoryLiveToolFacts = deriveMemoryLiveToolFacts(attachmentSendResult);
         taskControl.throwIfCancelled();
         if (!userReplyText && attachmentSendResult.sent.length > 0) {
           userReplyText = buildDefaultAttachmentReply(attachmentSendResult.sent);
@@ -4341,6 +5055,20 @@ async function main() {
             preferMarkdown: true,
           });
         }
+      }
+      if (memory.enabled) {
+        const activeMemoryThread = getCurrentThread(chatState);
+        const storedMemory = await updateBotMemoryStore(accountName, memory.roleMemory, (store) => {
+          return recordConversationIntoBotMemoryStore(store, {
+            userText: historyUserText || userText,
+            assistantText: replyText || codexRawReply,
+            liveToolFacts: memoryLiveToolFacts,
+            threadId: activeMemoryThread?.id || '',
+          });
+        });
+        console.log(
+          `memory_bundle=updated account=${accountName} profile=${storedMemory.profileFacts.length} role=${storedMemory.roleMemoryItems.length} history=${storedMemory.historyItems.length}`
+        );
       }
       if (replyMode === 'codex' && codex.historyTurns > 0) {
         const currentThread = getCurrentThread(chatState);
@@ -4469,6 +5197,9 @@ async function main() {
   console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
   console.log(`codex_history_turns=${codex.historyTurns}`);
   }
+  console.log(`memory_enabled=${memory.enabled ? 'true' : 'false'}`);
+  console.log(`memory_role_memory_chars=${memory.roleMemory.length}`);
+  if (memory.enabled) console.log(`memory_store=${botMemoryStorePath(accountName)}`);
   console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
   console.log(`speech_model=${speech.model}`);
   console.log(`speech_language=${speech.language || '(auto)'}`);
