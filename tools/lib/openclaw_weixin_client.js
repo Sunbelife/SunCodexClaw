@@ -20,6 +20,19 @@ function normalizeString(value) {
   return String(value || '').trim();
 }
 
+function assertWeixinOkResponse(payload, label) {
+  const hasErrcode = payload && Object.prototype.hasOwnProperty.call(payload, 'errcode');
+  const hasRet = payload && Object.prototype.hasOwnProperty.call(payload, 'ret');
+  const code = hasErrcode
+    ? Number(payload.errcode)
+    : hasRet
+      ? Number(payload.ret)
+      : 0;
+  if (Number.isNaN(code) || code === 0) return;
+  const message = normalizeString(payload?.errmsg) || `errcode=${code}`;
+  throw new Error(`${label} failed: ${message}`);
+}
+
 function ensureFetchAvailable() {
   if (typeof fetch !== 'function') {
     throw new Error('当前 Node.js 环境没有全局 fetch，请升级到 Node.js 18+');
@@ -149,7 +162,7 @@ async function sendWeixinText({
   if (!normalizedContextToken) throw new Error('缺少 context_token，无法发送微信回复');
 
   const clientId = generateClientId();
-  await postJson({
+  const response = await postJson({
     baseUrl,
     endpoint: 'ilink/bot/sendmessage',
     token,
@@ -170,6 +183,7 @@ async function sendWeixinText({
       base_info: {},
     },
   });
+  assertWeixinOkResponse(response, 'sendmessage');
   return { messageId: clientId };
 }
 
@@ -193,6 +207,7 @@ async function getTypingTicket({
       base_info: {},
     },
   });
+  assertWeixinOkResponse(response, 'getconfig');
   return normalizeString(response.typing_ticket);
 }
 
@@ -206,7 +221,7 @@ async function sendTypingStatus({
   routeTag = '',
 }) {
   if (!normalizeString(ilinkUserId) || !normalizeString(typingTicket)) return;
-  await postJson({
+  const response = await postJson({
     baseUrl,
     endpoint: 'ilink/bot/sendtyping',
     token,
@@ -219,6 +234,7 @@ async function sendTypingStatus({
       base_info: {},
     },
   });
+  assertWeixinOkResponse(response, 'sendtyping');
 }
 
 async function fetchLoginQr({

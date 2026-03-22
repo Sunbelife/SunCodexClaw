@@ -23,24 +23,26 @@
 - `tools/weixin_openclaw_bot.js`
   - 支持扫码登录
   - 支持长轮询 `getupdates`
-  - 支持把微信文本消息送进 `codex exec`
+  - 支持把微信文本、图片、文件消息送进 `codex exec`
   - 支持把回复按微信文本分片发回去
+  - 支持通过 `[[WEIXIN_SEND_IMAGE:...]]` / `[[WEIXIN_SEND_FILE:...]]` 直接回发本地图片和文件
   - 支持按发送方隔离 `codex` 会话上下文
   - 支持 `typing` 状态
 - `tools/lib/openclaw_weixin_client.js`
   - 封装了 `getupdates / sendmessage / getconfig / sendtyping`
   - 封装了二维码登录轮询
+- `tools/lib/openclaw_weixin_media.js`
+  - 封装了微信媒体上传、下载、AES 解密和附件落盘
 - `config/weixin_openclaw/default.example.json`
   - 给了独立的微信通道配置模板
 
 ## 当前还没补完的地方
 
-- 图片/文件上传回微信
-- 微信图片/文件入站下载后再交给 Codex
 - 多账号统一启停脚本
 - 和 Feishu 那套长期 memory bundle 的复用
+- 语音 / 视频消息处理
 
-也就是说，现在这条线已经能证明“我们的机器人可以按 OpenClaw 那个微信接法跑起来”，但还是实验版，先打通文本主链。
+也就是说，现在这条线已经能证明“我们的机器人可以按 OpenClaw 那个微信接法跑起来”，而且文本、图片、文件都已经打通；只是整体还属于实验版。
 
 ## 用法
 

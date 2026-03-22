@@ -32,15 +32,19 @@
 
 - 新增 `tools/weixin_openclaw_bot.js`
   - 直接复用 `@tencent-weixin/openclaw-weixin` 暴露出来的协议
-  - 支持二维码登录、长轮询收消息、Codex 文本回复、typing 状态
+  - 支持二维码登录、长轮询收消息、Codex 回复、typing 状态
+  - 支持微信图片/文件入站下载后交给 Codex
+  - 支持通过 `[[WEIXIN_SEND_IMAGE:...]]` / `[[WEIXIN_SEND_FILE:...]]` 把本地图片和文件回发到微信
 - 新增 `tools/weixin_openclaw_login_watch.js`
   - 支持扫码状态守护
   - 扫码确认后自动把 token 写入本地 secrets
   - 在 macOS 上通过 `launchctl` 拉起微信回复进程
+- 新增 `tools/lib/openclaw_weixin_media.js`
+  - 封装微信媒体上传、下载和解密
 - 新增 `config/weixin_openclaw/default.example.json`
 - 新增接入说明：`docs/openclaw-weixin-integration.md`
 
-现阶段先支持文本主链，图片和文件回传还没接完。
+现阶段已经支持文本、图片、文件主链；语音和视频还没接完。
 如果你是通过 macOS 的 `launchctl` 常驻运行，建议把 `codex.bin` 配成绝对路径，避免后台环境找不到 `codex`。
 
 ## 一句话

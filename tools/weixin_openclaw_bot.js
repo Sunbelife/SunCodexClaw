@@ -16,6 +16,11 @@ const {
   resolveCodexConfig,
 } = require('./lib/studio_runtime_support');
 const {
+  downloadWeixinAttachments,
+  getMimeFromFilename,
+  sendWeixinMediaFile,
+} = require('./lib/openclaw_weixin_media');
+const {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
   DEFAULT_LONG_POLL_TIMEOUT_MS,
@@ -43,6 +48,8 @@ const DEFAULT_CODEX_SYSTEM_PROMPT = [
   '默认使用简体中文，除非用户明确要求其他语言。',
 ].join('\n');
 const SESSION_EXPIRED_ERRCODE = -14;
+const WEIXIN_SEND_FILE_DIRECTIVE_PREFIX = '[[WEIXIN_SEND_FILE:';
+const WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX = '[[WEIXIN_SEND_IMAGE:';
 
 function getArg(flag, fallback = '') {
   const idx = process.argv.indexOf(flag);
@@ -129,6 +136,15 @@ function resolveWeixinRuntimeConfig(config) {
   if (!normalizeString(codexRaw.system_prompt)) {
     codexRaw.system_prompt = DEFAULT_CODEX_SYSTEM_PROMPT;
   }
+  if (!String(codexRaw.system_prompt || '').includes(WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX)) {
+    codexRaw.system_prompt = [
+      String(codexRaw.system_prompt || '').trim(),
+      '微信回复要求：',
+      `1. 如果需要把本机图片发给用户，请单独占行输出 ${WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX}/绝对或相对路径]]。`,
+      `2. 如果需要把本机文件发给用户，请单独占行输出 ${WEIXIN_SEND_FILE_DIRECTIVE_PREFIX}/绝对或相对路径]]。`,
+      '3. 除附件指令外，其他文字都会原样发送给微信用户。',
+    ].filter(Boolean).join('\n');
+  }
 
   return {
     botName: normalizeString(config.bot_name) || '微信 Codex 助手',
@@ -142,7 +158,7 @@ function resolveWeixinRuntimeConfig(config) {
     typingNotice: asBool(process.env.WEIXIN_OPENCLAW_TYPING_NOTICE || config.typing_notice, true),
     unsupportedMediaReply:
       normalizeString(config.unsupported_media_reply)
-      || '当前接入版先支持文本消息，图片和文件能力我还没在这个微信通道里接完。',
+      || '当前接入版支持文本、图片、文件；语音和视频还没接完。',
     longPollTimeoutMs: asInt(
       process.env.WEIXIN_OPENCLAW_LONG_POLL_TIMEOUT_MS || config.long_poll_timeout_ms,
       DEFAULT_LONG_POLL_TIMEOUT_MS,
@@ -169,6 +185,106 @@ function resolveWeixinRuntimeConfig(config) {
     ),
     codex: resolveCodexConfig({ codex: codexRaw }),
   };
+}
+
+function resolveLocalFilePath(raw, cwd = '') {
+  let value = String(raw || '').trim();
+  if (!value) return '';
+  value = value.replace(/^['"]+|['"]+$/g, '').trim();
+  if (!value) return '';
+  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(cwd || process.cwd(), value);
+}
+
+function extractWeixinAttachmentDirectives(rawText, cwd = '') {
+  const lines = String(rawText || '').replace(/\r/g, '').split('\n');
+  const attachments = [];
+  const keptLines = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.endsWith(']]') && trimmed.startsWith(WEIXIN_SEND_FILE_DIRECTIVE_PREFIX)) {
+      const payload = trimmed.slice(WEIXIN_SEND_FILE_DIRECTIVE_PREFIX.length, -2).trim();
+      const resolvedPath = resolveLocalFilePath(payload, cwd);
+      if (resolvedPath && !seen.has(`file:${resolvedPath}`)) {
+        seen.add(`file:${resolvedPath}`);
+        attachments.push({ type: 'file', path: resolvedPath });
+      }
+      continue;
+    }
+    if (trimmed.endsWith(']]') && trimmed.startsWith(WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX)) {
+      const payload = trimmed.slice(WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX.length, -2).trim();
+      const resolvedPath = resolveLocalFilePath(payload, cwd);
+      if (resolvedPath && !seen.has(`image:${resolvedPath}`)) {
+        seen.add(`image:${resolvedPath}`);
+        attachments.push({ type: 'image', path: resolvedPath });
+      }
+      continue;
+    }
+    keptLines.push(line);
+  }
+  return {
+    text: keptLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    attachments,
+  };
+}
+
+function buildDefaultAttachmentReply(attachments = []) {
+  const imageCount = attachments.filter((item) => item.type === 'image').length;
+  const fileCount = attachments.filter((item) => item.type === 'file').length;
+  if (imageCount > 0 && fileCount === 0) return '图片已发送，请查收。';
+  if (fileCount > 0 && imageCount === 0) return '文件已发送，请查收。';
+  if (fileCount > 0 || imageCount > 0) return '图片和文件已发送，请查收。';
+  return '';
+}
+
+function buildAttachmentSendFailureReply(sent = [], failed = []) {
+  if (failed.length === 0) return '';
+  const details = failed.map((item) => `${path.basename(item.path)}（${item.error}）`).join('；');
+  if (sent.length === 0) {
+    return compactText(`附件发送失败：${details}`, 4000);
+  }
+  return compactText(`部分附件发送失败：${details}`, 4000);
+}
+
+async function sendWeixinAttachments(config, userId, contextToken, attachments) {
+  const sent = [];
+  const failed = [];
+  for (const attachment of attachments) {
+    try {
+      if (!fs.existsSync(attachment.path)) {
+        throw new Error('文件不存在');
+      }
+      await sendWeixinMediaFile({
+        baseUrl: config.baseUrl,
+        token: config.token,
+        routeTag: config.routeTag,
+        to: userId,
+        contextToken,
+        filePath: attachment.path,
+      });
+      sent.push(attachment);
+    } catch (err) {
+      failed.push({
+        ...attachment,
+        error: compactText(err?.message || String(err), 180),
+      });
+    }
+  }
+  return { sent, failed };
+}
+
+function buildInboundUserText(textBody, downloadedAttachments = []) {
+  const lines = [];
+  if (textBody) lines.push(textBody);
+  if (downloadedAttachments.length > 0) {
+    if (!textBody) lines.push('用户发送了附件。');
+    lines.push('');
+    lines.push('用户还发送了这些附件，已下载到本地：');
+    for (const attachment of downloadedAttachments) {
+      lines.push(`- ${attachment.summary}`);
+    }
+  }
+  return lines.join('\n').trim();
 }
 
 function resolveRuntimePaths(accountName) {
@@ -298,6 +414,7 @@ async function handleInboundMessage({
   config,
   dryRun = false,
   ticketCache,
+  paths,
 }) {
   const userId = normalizeString(message?.from_user_id);
   if (!userId) return false;
@@ -307,7 +424,15 @@ async function handleInboundMessage({
 
   const contextToken = normalizeString(message?.context_token) || peerState.contextToken;
   const textBody = extractInboundText(message);
-  const hasUnsupportedMedia = hasUnsupportedInboundMedia(message);
+  const downloadedAttachments = dryRun
+    ? []
+    : await downloadWeixinAttachments({
+      message,
+      destDir: path.join(paths.accountDir, 'inbound'),
+    }).catch((err) => {
+      console.error(`weixin_media_download_error=${compactText(err?.message || String(err), 240)}`);
+      return [];
+    });
   peerState.contextToken = contextToken || peerState.contextToken;
   peerState.lastInboundAt = Date.now();
 
@@ -316,16 +441,11 @@ async function handleInboundMessage({
     return false;
   }
 
-  if (!textBody && hasUnsupportedMedia) {
-    if (!dryRun) {
-      await sendReplyChunks(config, userId, contextToken, config.unsupportedMediaReply);
-    }
-    return true;
-  }
-  if (!textBody) return false;
+  const userText = buildInboundUserText(textBody, downloadedAttachments);
+  if (!userText) return false;
   if (!config.autoReply) return false;
 
-  console.log(`weixin_inbound from=${userId} text=${JSON.stringify(compactText(textBody, 160))}`);
+  console.log(`weixin_inbound from=${userId} text=${JSON.stringify(compactText(userText, 160))} attachments=${downloadedAttachments.length}`);
   if (dryRun) return true;
 
   const typingState = await startTypingIfPossible(config, userId, contextToken, ticketCache);
@@ -333,15 +453,35 @@ async function handleInboundMessage({
     const codexReply = await generateCodexReply({
       codex: config.codex,
       history: peerState.history,
-      userText: textBody,
+      userText,
       sessionId: peerState.codexThreadId,
       threadTitle: buildThreadTitle(userId),
     });
-    const replyText = normalizeString(codexReply.reply)
-      || '我收到这条消息了，但这次没有生成可以发送的正文。';
-    await sendReplyChunks(config, userId, contextToken, replyText);
+    const replyPlan = extractWeixinAttachmentDirectives(codexReply.reply, config.codex.cwd || process.cwd());
+    let replyText = normalizeString(replyPlan.text);
+    if (!replyText && replyPlan.attachments.length === 0) {
+      replyText = '我收到这条消息了，但这次没有生成可以发送的正文。';
+    }
+    if (replyText) {
+      await sendReplyChunks(config, userId, contextToken, replyText);
+    }
+    const attachmentSendResult = await sendWeixinAttachments(config, userId, contextToken, replyPlan.attachments);
+    if (!replyText && attachmentSendResult.sent.length > 0) {
+      replyText = buildDefaultAttachmentReply(attachmentSendResult.sent);
+      if (replyText) {
+        await sendReplyChunks(config, userId, contextToken, replyText);
+      }
+    }
+    const attachmentFailureReply = buildAttachmentSendFailureReply(attachmentSendResult.sent, attachmentSendResult.failed);
+    if (attachmentFailureReply) {
+      await sendReplyChunks(config, userId, contextToken, attachmentFailureReply);
+    }
     peerState.codexThreadId = normalizeString(codexReply.threadId) || peerState.codexThreadId;
-    upsertHistory(peerState, textBody, replyText, config.codex.historyTurns);
+    const historyReplyText = [replyText]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    upsertHistory(peerState, userText, historyReplyText, config.codex.historyTurns);
     return true;
   } catch (err) {
     const messageText = `处理失败：${compactText(err?.message || String(err), 240)}`;
@@ -445,6 +585,7 @@ async function pollOnce({ state, paths, config, dryRun, ticketCache }) {
       config,
       dryRun,
       ticketCache,
+      paths,
     });
     changed = changed || handled;
   }
