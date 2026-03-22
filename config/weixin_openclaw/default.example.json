@@ -1,0 +1,23 @@
+{
+  "bot_name": "微信 Codex 助手",
+  "base_url": "https://ilinkai.weixin.qq.com",
+  "bot_type": "3",
+  "auto_reply": true,
+  "typing_notice": true,
+  "long_poll_timeout_ms": 35000,
+  "retry_delay_ms": 3000,
+  "login_timeout_ms": 480000,
+  "unsupported_media_reply": "当前接入版先支持文本消息，图片和文件能力我还没在这个微信通道里接完。",
+  "codex": {
+    "bin": "codex",
+    "model": "gpt-5.4",
+    "reasoning_effort": "high",
+    "profile": "",
+    "cwd": "/absolute/path/to/workspace",
+    "add_dirs": [],
+    "history_turns": 6,
+    "sandbox": "danger-full-access",
+    "approval_policy": "never",
+    "system_prompt": "你是“微信 Codex 助手”，通过微信和用户交流。\n请直接回答用户问题，不要复述用户原话。"
+  }
+}

@@ -13,7 +13,11 @@
     "feishu:restart": "bash tools/feishu_bot_ctl.sh restart all",
     "feishu:status": "bash tools/feishu_bot_ctl.sh status all",
     "feishu:install-launchagents": "bash tools/install_feishu_launchagents.sh install all",
-    "feishu:launchagents:status": "bash tools/install_feishu_launchagents.sh status all"
+    "feishu:launchagents:status": "bash tools/install_feishu_launchagents.sh status all",
+    "weixin:login": "node tools/weixin_openclaw_bot.js --account default --login",
+    "weixin:run": "node tools/weixin_openclaw_bot.js --account default",
+    "weixin:run:once": "node tools/weixin_openclaw_bot.js --account default --once",
+    "weixin:run:dry": "node tools/weixin_openclaw_bot.js --account default --dry-run --once"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",

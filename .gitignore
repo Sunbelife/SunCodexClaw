@@ -11,5 +11,7 @@ node_modules/
 # local runtime config
 config/feishu/*.json
 !config/feishu/*.example.json
+config/weixin_openclaw/*.json
+!config/weixin_openclaw/*.example.json
 config/secrets/*.yaml
 !config/secrets/*.example.yaml

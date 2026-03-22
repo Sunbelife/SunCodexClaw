@@ -2,6 +2,8 @@
 
 `SunCodexClaw` 是一个面向飞书工作流的 Codex 机器人项目。
 
+现在仓库里也带了一条实验性的 `OpenClaw Weixin` 接入线，用来验证“我们的机器人是否能按 OpenClaw 那种扫码登录 + 长轮询方式接进微信”。
+
 它不是把 LLM 包一层聊天壳，而是把飞书消息、Codex 工作区、本地文件、云文档进度、多账号运行和本机执行能力串成一条真正能干活的链路。
 
 ![Quick Start](docs/images/quickstart-terminal.svg)
@@ -23,6 +25,23 @@
    - 记忆写入前会做过滤和摘要，不会把一大段代码、临时路径、附件指令之类的噪音直接塞进去。
 
 一句话说，现在它已经不是“每个线程一小段上下文”的水平，而是“每个机器人有自己的长期本地记忆 + 每个线程保留短期上下文”。
+
+## 2026-03-22 微信实验接入
+
+这次补的是一条最小可跑的微信通道，不是把 OpenClaw 整套搬进来。
+
+- 新增 `tools/weixin_openclaw_bot.js`
+  - 直接复用 `@tencent-weixin/openclaw-weixin` 暴露出来的协议
+  - 支持二维码登录、长轮询收消息、Codex 文本回复、typing 状态
+- 新增 `tools/weixin_openclaw_login_watch.js`
+  - 支持扫码状态守护
+  - 扫码确认后自动把 token 写入本地 secrets
+  - 在 macOS 上通过 `launchctl` 拉起微信回复进程
+- 新增 `config/weixin_openclaw/default.example.json`
+- 新增接入说明：`docs/openclaw-weixin-integration.md`
+
+现阶段先支持文本主链，图片和文件回传还没接完。
+如果你是通过 macOS 的 `launchctl` 常驻运行，建议把 `codex.bin` 配成绝对路径，避免后台环境找不到 `codex`。
 
 ## 一句话
 
