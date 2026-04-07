@@ -52,6 +52,16 @@ if [[ -z "${NODE_BIN_RESOLVED}" ]]; then
   NODE_BIN_RESOLVED="${NODE_BIN}"
 fi
 
+append_export_if_set() {
+  local __outvar="$1"
+  local key="$2"
+  local value="${!key-}"
+  [[ -n "${__outvar}" && -n "${key}" ]] || return 0
+  if [[ -n "${value}" ]]; then
+    printf -v "${__outvar}" '%s export %s=%q;' "${!__outvar-}" "${key}" "${value}"
+  fi
+}
+
 yaml_config_names() {
   [[ -f "${REPO_DIR}/tools/lib/local_secret_store.js" ]] || return 0
   REPO_DIR_ENV="${REPO_DIR}" "${NODE_BIN_RESOLVED}" - <<'EOF' 2>/dev/null || true
@@ -158,7 +168,7 @@ is_launchctl_bot_running() {
 
 start_one_launchctl() {
   local account="$1"
-  local pidf logf label pid cmd
+  local pidf logf label pid cmd env_exports
   pidf="$(pid_file "${account}")"
   logf="$(log_file "${account}")"
   label="$(launchctl_label "${account}")"
@@ -178,8 +188,15 @@ start_one_launchctl() {
     echo "[$(date '+%F %T')] starting account=${account} manager=launchctl"
   } >> "${logf}"
 
-  printf -v cmd 'export PATH=%q; cd %q; exec %q %q --account %q >> %q 2>&1' \
+  env_exports=''
+  append_export_if_set env_exports ZEROCHAT_API_KEY
+  append_export_if_set env_exports OPENAI_API_KEY
+  append_export_if_set env_exports CODEX_API_KEY
+  append_export_if_set env_exports CODEX_HOME
+
+  printf -v cmd 'export PATH=%q;%s cd %q; exec %q %q --account %q >> %q 2>&1' \
     "${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+    "${env_exports}" \
     "${REPO_DIR}" \
     "${NODE_BIN_RESOLVED}" \
     "${BOT_SCRIPT}" \
@@ -305,6 +322,10 @@ start_one() {
     echo "[$(date '+%F %T')] starting account=${account}"
   } >> "${logf}"
 
+  ZEROCHAT_API_KEY="${ZEROCHAT_API_KEY-}" \
+  OPENAI_API_KEY="${OPENAI_API_KEY-}" \
+  CODEX_API_KEY="${CODEX_API_KEY-}" \
+  CODEX_HOME="${CODEX_HOME-}" \
   nohup "${NODE_BIN}" "${BOT_SCRIPT}" --account "${account}" >> "${logf}" 2>&1 &
   pid="$!"
   echo "${pid}" > "${pidf}"

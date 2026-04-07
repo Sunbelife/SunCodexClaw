@@ -768,45 +768,168 @@ function stripLeadingTextMentions(rawText, aliases = []) {
 
 function parsePostContent(rawContent) {
   const content = String(rawContent || '').trim();
-  if (!content) return { text: '', imageKeys: [] };
+  if (!content) return { text: '', imageKeys: [], fileAttachments: [] };
+  let parsed = null;
   try {
-    const parsed = JSON.parse(content);
-    const post = parsed?.post || parsed;
-    const localeEntries = Object.values(post || {});
-    const preferred = post?.zh_cn || post?.en_us || localeEntries[0] || {};
-    const blocks = Array.isArray(preferred?.content) ? preferred.content : [];
-    const textParts = [];
-    const imageKeys = [];
+    parsed = JSON.parse(content);
+  } catch (_) {
+    return { text: '', imageKeys: [], fileAttachments: [] };
+  }
+  const post = parsed?.post || parsed;
+  const localeEntries = Object.values(post || {});
+  const preferred = post?.zh_cn || post?.en_us || localeEntries[0] || {};
+  const blocks = Array.isArray(preferred?.content) ? preferred.content : [];
+  const textParts = [];
+  const imageKeys = [];
+  const fileAttachments = [];
+  const seenObjects = new Set();
 
-    if (typeof preferred?.title === 'string' && preferred.title.trim()) {
-      textParts.push(preferred.title.trim());
-    }
+  function normalizeStructuredValue(rawValue, maxLength = 500) {
+    const text = String(rawValue || '')
+      .replace(/\r/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return '';
+    if (text.length > maxLength) return `${text.slice(0, maxLength)}...`;
+    return text;
+  }
 
-    for (const block of blocks) {
-      if (!Array.isArray(block)) continue;
-      for (const item of block) {
-        const tag = String(item?.tag || '').trim().toLowerCase();
-        if (tag === 'text') {
-          const itemText = String(item?.text || '').trim();
-          if (itemText) textParts.push(itemText);
-          continue;
+  function collectFieldValues(root, targetKeys, maxValues = 12) {
+    const wanted = new Set(
+      (Array.isArray(targetKeys) ? targetKeys : [targetKeys])
+        .map((key) => String(key || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    if (!root || wanted.size === 0) return [];
+
+    const results = [];
+    const stack = [root];
+    let loopGuard = 0;
+    while (stack.length > 0 && results.length < maxValues && loopGuard < 4000) {
+      loopGuard += 1;
+      const current = stack.pop();
+      if (current === null || current === undefined) continue;
+      if (typeof current !== 'object') continue;
+      if (seenObjects.has(current)) continue;
+      seenObjects.add(current);
+
+      if (Array.isArray(current)) {
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          stack.push(current[index]);
         }
-        if (tag === 'img' || tag === 'image') {
-          const imageKey = String(
-            item?.image_key || item?.imageKey || item?.file_key || item?.fileKey || ''
-          ).trim();
-          if (imageKey) imageKeys.push(imageKey);
+        continue;
+      }
+
+      for (const [key, value] of Object.entries(current)) {
+        const normalizedKey = String(key || '').trim().toLowerCase();
+        if (wanted.has(normalizedKey) && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')) {
+          const normalizedValue = normalizeStructuredValue(value);
+          if (normalizedValue) results.push(normalizedValue);
+        }
+        if (value && typeof value === 'object') {
+          stack.push(value);
         }
       }
     }
 
-    return {
-      text: textParts.join('\n').trim(),
-      imageKeys: uniqueStrings(imageKeys),
-    };
-  } catch (_) {
-    return { text: '', imageKeys: [] };
+    return uniqueStrings(results);
   }
+
+  if (typeof preferred?.title === 'string' && preferred.title.trim()) {
+    textParts.push(preferred.title.trim());
+  }
+
+  for (const block of blocks) {
+    if (!Array.isArray(block)) continue;
+    for (const item of block) {
+      const tag = String(item?.tag || '').trim().toLowerCase();
+      if (tag === 'text') {
+        const itemText = String(item?.text || '').trim();
+        if (itemText) textParts.push(itemText);
+        continue;
+      }
+      if (tag === 'img' || tag === 'image') {
+        const imageKey = String(
+          item?.image_key || item?.imageKey || item?.file_key || item?.fileKey || ''
+        ).trim();
+        if (imageKey) imageKeys.push(imageKey);
+        continue;
+      }
+      if (tag === 'file' || tag === 'media' || tag === 'attachment') {
+        const fileKey = String(
+          item?.file_key || item?.fileKey || item?.media_key || item?.mediaKey || ''
+        ).trim();
+        const fileName = String(
+          item?.file_name || item?.fileName || item?.name || ''
+        ).trim();
+        if (fileKey) {
+          fileAttachments.push({ fileKey, fileName, fileSize: 0 });
+        }
+      }
+    }
+  }
+
+  // Newer Feishu rich-text/post payloads may not use the legacy `content[][]`
+  // block layout. Fall back to a generic recursive extraction so markdown-like
+  // rich text still reaches the bot instead of being treated as empty.
+  if (textParts.length === 0) {
+    const fallbackTextParts = collectFieldValues(
+      post,
+      [
+        'text',
+        'content',
+        'content_text',
+        'contentText',
+        'title',
+        'subtitle',
+        'summary',
+        'description',
+        'markdown',
+        'md_text',
+        'plain_text',
+        'plainText',
+      ],
+      12
+    );
+    textParts.push(...fallbackTextParts);
+  }
+
+  if (imageKeys.length === 0) {
+    imageKeys.push(
+      ...collectFieldValues(post, ['image_key', 'imageKey', 'file_key', 'fileKey'], 16)
+    );
+  }
+
+  if (fileAttachments.length === 0) {
+    const seenFileKeys = new Set();
+    const candidateFileKeys = collectFieldValues(
+      post,
+      ['file_key', 'fileKey', 'media_key', 'mediaKey', 'attachment_key', 'attachmentKey'],
+      16
+    );
+    const candidateFileNames = collectFieldValues(
+      post,
+      ['file_name', 'fileName', 'name', 'filename'],
+      16
+    );
+    for (let index = 0; index < candidateFileKeys.length; index += 1) {
+      const fileKey = String(candidateFileKeys[index] || '').trim();
+      if (!fileKey || seenFileKeys.has(fileKey)) continue;
+      seenFileKeys.add(fileKey);
+      fileAttachments.push({
+        fileKey,
+        fileName: String(candidateFileNames[index] || '').trim(),
+        fileSize: 0,
+      });
+    }
+  }
+
+  return {
+    text: uniqueStrings(textParts).join('\n').trim(),
+    imageKeys: uniqueStrings(imageKeys),
+    fileAttachments: fileAttachments.filter((item) => item.fileKey),
+  };
 }
 
 function stripAnsi(rawText) {
