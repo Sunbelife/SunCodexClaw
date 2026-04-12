@@ -9,6 +9,16 @@ const {
   resolveSecretsFile,
   upsertConfigEntry,
 } = require('./lib/local_secret_store');
+const {
+  resolveDailyStoreReportConfig,
+} = require('./lib/daily_store_report');
+const {
+  createScheduledJobManager,
+} = require('./lib/daily_report_task_manager');
+const {
+  normalizeChannelType,
+  normalizeTargetType,
+} = require('./lib/message_channel_delivery');
 
 let lark = null;
 try {
@@ -33,6 +43,15 @@ const DEFAULT_CODEX_SYSTEM_PROMPT = [
   '不要承诺“稍后回复”或“几分钟后回复”；必须在当前这一条里给出可执行结果，或明确失败原因。',
   '默认使用简体中文，除非用户明确要求其他语言。',
 ].join('\n');
+const DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT = [
+  '你是“飞书本地 Qwen 助手”，通过飞书和用户交流。',
+  '当前接入的是本机本地文本模型，本身不直接读取文件、执行命令、修改代码或访问网络。',
+  '但你可以把需要本机权限、Skills、MCP、命令执行、代码修改的任务转交给 codex cli。',
+  '请直接回答用户问题，不要复述用户原话。',
+  '如果用户的问题依赖图片、文件、本地代码库或联网信息，而消息文本本身不足以回答，请明确说明当前本地模型接入只支持基于文本内容作答。',
+  '如果任务需要调用 codex，请只输出一种委托指令，不要输出其他正文：[[CODEX_DELEGATE: 这里写给 codex 的明确执行任务]]。',
+  '默认使用简体中文，除非用户明确要求其他语言。',
+].join('\n');
 const FORCE_EXECUTE_CODE_TASK_PROMPT = [
   '用户这次是在要求你直接修改代码、排查问题或处理工程任务。',
   '默认先查看代码并直接动手实现，不要只给方案，不要只口头答应。',
@@ -46,7 +65,10 @@ const FEISHU_FILE_UPLOAD_LIMIT = 30 * 1024 * 1024;
 const FEISHU_IMAGE_UPLOAD_LIMIT = 10 * 1024 * 1024;
 const FEISHU_SEND_FILE_DIRECTIVE_PREFIX = '[[FEISHU_SEND_FILE:';
 const FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX = '[[FEISHU_SEND_IMAGE:';
-const FEISHU_GROUP_MENTION_CARRY_WINDOW_MS = 2 * 60 * 1000;
+const CODEX_DELEGATE_INLINE_PREFIX = '[[CODEX_DELEGATE:';
+const CODEX_DELEGATE_BLOCK_START = '[[CODEX_DELEGATE]]';
+const CODEX_DELEGATE_BLOCK_END = '[[/CODEX_DELEGATE]]';
+const FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS = 15 * 1000;
 const FEISHU_DOCX_TEXT_BLOCK_TYPE = 2;
 const FEISHU_DOCX_HEADING2_BLOCK_TYPE = 4;
 const FEISHU_DOCX_HEADING3_BLOCK_TYPE = 5;
@@ -79,6 +101,7 @@ const CONTENT_TYPE_EXTENSION_MAP = new Map([
 const REPO_DIR = path.resolve(__dirname, '..');
 const FEISHU_RUNTIME_DIR = path.join(REPO_DIR, '.runtime', 'feishu');
 const FEISHU_MEMORY_DIR = path.join(FEISHU_RUNTIME_DIR, 'memory');
+const FEISHU_INCOMING_ATTACHMENT_DIR = path.join(os.homedir(), 'Downloads', 'SunCodexClaw', 'feishu');
 const FEISHU_MEMORY_HEADER = '<<SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_FOOTER = '<<END_SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_SCOPE_PROFILE = 'profile_facts';
@@ -133,6 +156,17 @@ function asInt(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_
   return Math.min(max, Math.max(min, n));
 }
 
+function asFloat(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number.parseFloat(String(value));
+  if (Number.isNaN(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function normalizeString(value) {
+  return String(value || '').trim();
+}
+
 function resolveOptionalDir(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -151,6 +185,13 @@ function resolveOptionalDirList(value) {
     out.push(resolved);
   }
   return out;
+}
+
+function resolveOptionalPath(value, baseDir = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (path.isAbsolute(raw)) return path.resolve(raw);
+  return path.resolve(baseDir || process.cwd(), raw);
 }
 
 function pickValue(candidates) {
@@ -241,8 +282,8 @@ function resolveCredentials(config) {
 
 function resolveReplyMode(config) {
   const raw = String(getArg('--reply-mode', process.env.FEISHU_REPLY_MODE || config.reply_mode || 'codex')).trim().toLowerCase();
-  if (raw === 'codex' || raw === 'echo') return raw;
-  throw new Error(`invalid reply_mode "${raw}", expected codex | echo`);
+  if (raw === 'codex' || raw === 'echo' || raw === 'local_model') return raw;
+  throw new Error(`invalid reply_mode "${raw}", expected codex | echo | local_model`);
 }
 
 function resolveProgressConfig(config) {
@@ -448,6 +489,76 @@ function resolveCodexConfig(config) {
   };
 }
 
+function resolveLocalModelConfig(config) {
+  const localModelConfig = config.local_model || config.localModel || {};
+  const cwd = resolveOptionalDir(
+    getArg('--local-model-cwd', process.env.FEISHU_LOCAL_MODEL_CWD || localModelConfig.cwd || '')
+  );
+  const promptScript = resolveOptionalPath(
+    getArg(
+      '--local-model-prompt-script',
+      process.env.FEISHU_LOCAL_MODEL_PROMPT_SCRIPT
+        || localModelConfig.prompt_script
+        || localModelConfig.promptScript
+        || (cwd ? 'prompt.sh' : '')
+    ),
+    cwd || process.cwd()
+  );
+
+  return {
+    cwd,
+    promptScript,
+    serverBaseUrl: String(
+      getArg(
+        '--local-model-server-base-url',
+        process.env.FEISHU_LOCAL_MODEL_SERVER_BASE_URL || localModelConfig.server_base_url || localModelConfig.serverBaseUrl || ''
+      )
+    ).trim().replace(/\/+$/, ''),
+    requestTimeoutMs: asInt(
+      getArg(
+        '--local-model-request-timeout-ms',
+        process.env.FEISHU_LOCAL_MODEL_REQUEST_TIMEOUT_MS || localModelConfig.request_timeout_ms || localModelConfig.requestTimeoutMs
+      ),
+      180000,
+      1000,
+      1800000
+    ),
+    model: String(
+      getArg('--local-model-model', process.env.FEISHU_LOCAL_MODEL_MODEL || localModelConfig.model || '')
+    ).trim(),
+    maxKvSize: asInt(
+      getArg('--local-model-max-kv-size', process.env.FEISHU_LOCAL_MODEL_MAX_KV_SIZE || localModelConfig.max_kv_size || localModelConfig.maxKvSize),
+      1024,
+      64,
+      262144
+    ),
+    maxTokens: asInt(
+      getArg('--local-model-max-tokens', process.env.FEISHU_LOCAL_MODEL_MAX_TOKENS || localModelConfig.max_tokens || localModelConfig.maxTokens),
+      384,
+      1,
+      8192
+    ),
+    temp: asFloat(
+      getArg('--local-model-temp', process.env.FEISHU_LOCAL_MODEL_TEMP || localModelConfig.temp),
+      0.2,
+      0,
+      2
+    ),
+    historyTurns: asInt(
+      getArg('--local-model-history-turns', process.env.FEISHU_LOCAL_MODEL_HISTORY_TURNS || localModelConfig.history_turns || localModelConfig.historyTurns),
+      4,
+      0,
+      20
+    ),
+    systemPrompt: String(
+      getArg(
+        '--local-model-system-prompt',
+        process.env.FEISHU_LOCAL_MODEL_SYSTEM_PROMPT || localModelConfig.system_prompt || localModelConfig.systemPrompt || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT
+      )
+    ).trim() || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT,
+  };
+}
+
 function resolveMemoryConfig(config) {
   const memoryConfig = config.memory || {};
   return {
@@ -548,6 +659,20 @@ function detectCodex(bin) {
   return detectBinary(bin, ['--version']);
 }
 
+function detectLocalModel(localModel) {
+  const cwd = String(localModel?.cwd || '').trim();
+  const promptScript = String(localModel?.promptScript || '').trim();
+  const serverBaseUrl = String(localModel?.serverBaseUrl || '').trim();
+  const cwdFound = Boolean(cwd && fs.existsSync(cwd));
+  const promptScriptFound = Boolean(promptScript && fs.existsSync(promptScript));
+  return {
+    cwdFound,
+    promptScriptFound,
+    serverConfigured: Boolean(serverBaseUrl),
+    ready: cwdFound && (promptScriptFound || Boolean(serverBaseUrl)),
+  };
+}
+
 function parseMessageText(rawContent) {
   const content = String(rawContent || '').trim();
   if (!content) return '';
@@ -558,6 +683,102 @@ function parseMessageText(rawContent) {
     return '';
   }
   return '';
+}
+
+function safeParseMessageContent(rawContent) {
+  const content = String(rawContent || '').trim();
+  if (!content) return null;
+  try {
+    return JSON.parse(content);
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeStructuredTextValue(rawValue, maxLength = 500) {
+  const text = String(rawValue || '')
+    .replace(/\r/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) return '';
+  if (text.length > maxLength) return `${text.slice(0, maxLength)}...`;
+  return text;
+}
+
+function collectStructuredFieldValues(root, targetKeys, maxValues = 8) {
+  const wanted = new Set(
+    (Array.isArray(targetKeys) ? targetKeys : [targetKeys])
+      .map((key) => String(key || '').trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (!root || wanted.size === 0) return [];
+
+  const results = [];
+  const visited = new Set();
+  const stack = [root];
+  let loopGuard = 0;
+
+  while (stack.length > 0 && results.length < maxValues && loopGuard < 4000) {
+    loopGuard += 1;
+    const current = stack.pop();
+    if (current === null || current === undefined) continue;
+    if (typeof current !== 'object') continue;
+    if (visited.has(current)) continue;
+    visited.add(current);
+
+    if (Array.isArray(current)) {
+      for (let i = current.length - 1; i >= 0; i -= 1) {
+        stack.push(current[i]);
+      }
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(current)) {
+      const normalizedKey = String(key || '').trim().toLowerCase();
+      if (wanted.has(normalizedKey) && (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')) {
+        const normalizedValue = normalizeStructuredTextValue(value, 500);
+        if (normalizedValue) results.push(normalizedValue);
+      }
+      if (value && typeof value === 'object') {
+        stack.push(value);
+      }
+    }
+  }
+
+  return uniqueStrings(results);
+}
+
+function extractInlineTextFromParsedContent(parsed, options = {}) {
+  const {
+    keys = ['text', 'caption', 'description', 'summary', 'comment', 'message', 'content_text', 'contentText'],
+    excludeValues = [],
+    limit = 3,
+  } = options || {};
+  const excluded = new Set(
+    (Array.isArray(excludeValues) ? excludeValues : [excludeValues])
+      .map((value) => normalizeStructuredTextValue(value, 500).toLowerCase())
+      .filter(Boolean)
+  );
+  return collectStructuredFieldValues(parsed, keys, Math.max(4, limit * 4))
+    .map((value) => normalizeStructuredTextValue(value, 500))
+    .filter((value) => value && !excluded.has(value.toLowerCase()))
+    .slice(0, limit);
+}
+
+function extractQuotedMessageIdsFromParsedContent(parsed) {
+  if (!parsed || typeof parsed !== 'object') return [];
+  const quoteRoots = [
+    parsed.quote,
+    parsed.quote_container,
+    parsed.quoteContainer,
+    parsed.quoted,
+  ].filter((item) => item && typeof item === 'object');
+
+  return uniqueStrings([
+    ...collectStructuredFieldValues(parsed, ['quote_message_id', 'quoteMessageId'], 4),
+    ...quoteRoots.flatMap((item) => collectStructuredFieldValues(item, ['message_id', 'messageId'], 2)),
+  ]);
 }
 
 function parseImageKey(rawContent) {
@@ -576,42 +797,44 @@ function parseImageKey(rawContent) {
 
 function parseFileMessageContent(rawContent) {
   const content = String(rawContent || '').trim();
-  if (!content) return { fileKey: '', fileName: '', fileSize: 0 };
-  try {
-    const parsed = JSON.parse(content);
-    const fileKey = String(
-      parsed?.file_key
-      || parsed?.fileKey
-      || parsed?.file?.file_key
-      || parsed?.file?.fileKey
-      || ''
-    ).trim();
-    const fileName = String(
-      parsed?.file_name
-      || parsed?.fileName
-      || parsed?.name
-      || parsed?.file?.file_name
-      || parsed?.file?.fileName
-      || parsed?.file?.name
-      || ''
-    ).trim();
-    const rawSize = Number(
-      parsed?.file_size
-      || parsed?.fileSize
-      || parsed?.size
-      || parsed?.file?.file_size
-      || parsed?.file?.fileSize
-      || parsed?.file?.size
-      || 0
-    );
-    return {
-      fileKey,
-      fileName,
-      fileSize: Number.isFinite(rawSize) ? rawSize : 0,
-    };
-  } catch (_) {
-    return { fileKey: '', fileName: '', fileSize: 0 };
-  }
+  if (!content) return { fileKey: '', fileName: '', fileSize: 0, text: '' };
+  const parsed = safeParseMessageContent(content);
+  if (!parsed) return { fileKey: '', fileName: '', fileSize: 0, text: '' };
+  const fileKey = String(
+    parsed?.file_key
+    || parsed?.fileKey
+    || parsed?.file?.file_key
+    || parsed?.file?.fileKey
+    || ''
+  ).trim();
+  const fileName = String(
+    parsed?.file_name
+    || parsed?.fileName
+    || parsed?.name
+    || parsed?.file?.file_name
+    || parsed?.file?.fileName
+    || parsed?.file?.name
+    || ''
+  ).trim();
+  const rawSize = Number(
+    parsed?.file_size
+    || parsed?.fileSize
+    || parsed?.size
+    || parsed?.file?.file_size
+    || parsed?.file?.fileSize
+    || parsed?.file?.size
+    || 0
+  );
+  const inlineText = extractInlineTextFromParsedContent(parsed, {
+    excludeValues: [fileName],
+    limit: 2,
+  }).join('\n');
+  return {
+    fileKey,
+    fileName,
+    fileSize: Number.isFinite(rawSize) ? rawSize : 0,
+    text: inlineText,
+  };
 }
 
 function parseAudioMessageContent(rawContent) {
@@ -1268,6 +1491,179 @@ function isMessageEditLimitError(err) {
   return false;
 }
 
+function getFeishuApiResponseData(err) {
+  if (!err || typeof err !== 'object') return null;
+  const responseData = err?.response?.data;
+  if (responseData && typeof responseData === 'object') return responseData;
+  const data = err?.data;
+  if (data && typeof data === 'object') return data;
+  return null;
+}
+
+function getFeishuApiStatus(err) {
+  const status = err?.response?.status ?? err?.status ?? null;
+  const numeric = Number(status);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function getFeishuApiCode(err) {
+  const data = getFeishuApiResponseData(err);
+  const code = data?.code ?? data?.error?.code ?? err?.code ?? null;
+  if (code === null || code === undefined || code === '') return '';
+  return String(code).trim();
+}
+
+function summarizeFeishuFieldViolations(fieldViolations) {
+  if (!Array.isArray(fieldViolations) || fieldViolations.length === 0) return '';
+  return fieldViolations
+    .slice(0, 3)
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return normalizeProgressSnippet(item, 120);
+      }
+      const field =
+        normalizeProgressSnippet(item.field || item.name || item.key || item.path || '', 80)
+        || 'field';
+      const message =
+        normalizeProgressSnippet(
+          item.description
+          || item.message
+          || item.msg
+          || item.reason
+          || item.error_message
+          || '',
+          120
+        )
+        || normalizeProgressSnippet(safeJsonStringify(item, 200), 120);
+      return `${field}: ${message}`;
+    })
+    .filter(Boolean)
+    .join('; ');
+}
+
+function describeFeishuApiError(err) {
+  const parts = [];
+  const message = normalizeProgressSnippet(err?.message || '', 240);
+  if (message) parts.push(`message=${message}`);
+
+  const status = getFeishuApiStatus(err);
+  if (status) parts.push(`http_status=${status}`);
+
+  const data = getFeishuApiResponseData(err);
+  const code = getFeishuApiCode(err);
+  if (code) parts.push(`code=${code}`);
+
+  const apiMessage = normalizeProgressSnippet(
+    data?.msg || data?.message || data?.error?.message || data?.error?.msg || '',
+    240
+  );
+  if (apiMessage) parts.push(`api_message=${apiMessage}`);
+
+  const logID = normalizeProgressSnippet(data?.log_id || data?.error?.log_id || '', 120);
+  if (logID) parts.push(`log_id=${logID}`);
+
+  const violations = summarizeFeishuFieldViolations(data?.field_violations);
+  if (violations) parts.push(`field_violations=${violations}`);
+
+  return parts.join(' ') || 'unknown_error';
+}
+
+function extractFeishuPermissionViolations(err) {
+  const data = getFeishuApiResponseData(err);
+  const raw = Array.isArray(data?.permission_violations)
+    ? data.permission_violations
+    : Array.isArray(data?.error?.permission_violations)
+      ? data.error.permission_violations
+      : [];
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== 'object') {
+        return normalizeProgressSnippet(item, 120);
+      }
+      return normalizeProgressSnippet(
+        item.scope
+        || item.permission
+        || item.name
+        || item.key
+        || item.code
+        || item.msg
+        || item.message
+        || '',
+        120
+      );
+    })
+    .filter(Boolean);
+}
+
+function classifyFeishuDocFailure(err) {
+  const status = getFeishuApiStatus(err);
+  const code = getFeishuApiCode(err);
+  const data = getFeishuApiResponseData(err);
+  const message = normalizeProgressSnippet(
+    [
+      err?.message,
+      data?.msg,
+      data?.message,
+      data?.error?.message,
+      data?.error?.msg,
+    ].filter(Boolean).join(' '),
+    400
+  ).toLowerCase();
+  const permissions = extractFeishuPermissionViolations(err);
+
+  if (
+    status === 429
+    || code === '429'
+    || message.includes('status code 429')
+    || message.includes('frequency limit')
+    || message.includes('too many request')
+    || message.includes('rate limit')
+  ) {
+    return {
+      type: 'rate_limit',
+      permissions,
+      userNotice: '进度文档接口触发限流，已自动跳过文档更新，任务会继续执行。',
+      logReason: 'doc_rate_limited',
+    };
+  }
+
+  if (
+    code === '99991672'
+    || permissions.length > 0
+    || message.includes('access denied')
+    || message.includes('权限')
+    || message.includes('scope is required')
+  ) {
+    const permissionText = permissions.length > 0
+      ? permissions.join(', ')
+      : 'docs:permission.member, docs:permission.member:create';
+    return {
+      type: 'permission',
+      permissions,
+      userNotice: `进度文档权限不足（缺少 ${permissionText}），已自动跳过文档更新，任务会继续执行。`,
+      logReason: 'doc_permission_denied',
+    };
+  }
+
+  return {
+    type: 'other',
+    permissions,
+    userNotice: '进度文档暂时不可用，已自动跳过文档更新，任务会继续执行。',
+    logReason: 'doc_unavailable',
+  };
+}
+
+function isRetryableFeishuDocWriteError(err) {
+  const status = getFeishuApiStatus(err);
+  if (status === 429) return true;
+
+  const code = getFeishuApiCode(err);
+  if (code === '99991400') return true;
+
+  const details = describeFeishuApiError(err).toLowerCase();
+  return details.includes('frequency limit') || details.includes('too many request');
+}
+
 function formatCodexProgressEvent(event) {
   const type = String(event?.type || '').trim();
   if (!type) return '';
@@ -1333,6 +1729,125 @@ function normalizeIncomingText(rawText, mentions = [], mentionAliases = []) {
   text = text.replace(/\u00a0/g, ' ');
   text = text.replace(/^(?:@\S+\s*)+/, '');
   return text.trim();
+}
+
+function normalizeSenderIdentity(identity = {}) {
+  return {
+    displayName: String(identity.displayName || identity.name || '').trim(),
+    openId: String(identity.openId || identity.open_id || '').trim(),
+    userId: String(identity.userId || identity.user_id || '').trim(),
+    unionId: String(identity.unionId || identity.union_id || '').trim(),
+    senderType: String(identity.senderType || identity.sender_type || '').trim(),
+  };
+}
+
+function extractEventSenderIdentity(eventData = {}) {
+  const sender = eventData?.sender || {};
+  const senderId = sender?.sender_id || {};
+  return normalizeSenderIdentity({
+    displayName: sender.name || sender.display_name || sender.displayName || '',
+    openId: senderId.open_id || senderId.openId || '',
+    userId: senderId.user_id || senderId.userId || '',
+    unionId: senderId.union_id || senderId.unionId || '',
+    senderType: sender.sender_type || sender.senderType || '',
+  });
+}
+
+function extractMessageSenderIdentity(messageItem = {}) {
+  const sender = messageItem?.sender || {};
+  const senderId = String(sender.id || '').trim();
+  const senderIdType = String(sender.id_type || sender.idType || '').trim().toLowerCase();
+  const senderObjectId = sender?.sender_id || sender?.senderId || {};
+  return normalizeSenderIdentity({
+    displayName: sender.name || sender.display_name || sender.displayName || sender.sender_name || sender.senderName || '',
+    openId: senderIdType === 'open_id'
+      ? senderId
+      : senderObjectId.open_id || senderObjectId.openId || '',
+    userId: senderIdType === 'user_id'
+      ? senderId
+      : senderObjectId.user_id || senderObjectId.userId || '',
+    unionId: senderIdType === 'union_id'
+      ? senderId
+      : senderObjectId.union_id || senderObjectId.unionId || '',
+    senderType: sender.sender_type || sender.senderType || '',
+  });
+}
+
+function buildSenderIdentitySummary(identity = {}, { includeType = false } = {}) {
+  const normalized = normalizeSenderIdentity(identity);
+  const parts = [];
+  if (normalized.displayName) parts.push(normalized.displayName);
+  if (normalized.openId) parts.push(`open_id=${normalized.openId}`);
+  if (normalized.userId) parts.push(`user_id=${normalized.userId}`);
+  if (normalized.unionId) parts.push(`union_id=${normalized.unionId}`);
+  if (includeType && normalized.senderType) parts.push(`type=${normalized.senderType}`);
+  return uniqueStrings(parts).join('，');
+}
+
+function extractQuotedMessageIdsFromRawContent(rawContent) {
+  return extractQuotedMessageIdsFromParsedContent(safeParseMessageContent(rawContent));
+}
+
+function summarizeFeishuMessageContent(messageType, rawContent = '') {
+  const type = String(messageType || '').trim().toLowerCase();
+  if (type === 'text') {
+    return compactText(parseMessageText(rawContent), 1200);
+  }
+  if (type === 'post') {
+    const parsed = parsePostContent(rawContent);
+    const lines = [];
+    if (parsed.text) lines.push(parsed.text);
+    if (Array.isArray(parsed.fileAttachments) && parsed.fileAttachments.length > 0) {
+      const fileNames = parsed.fileAttachments.map((item) => item.fileName).filter(Boolean);
+      lines.push(fileNames.length > 0 ? `[文件 ${parsed.fileAttachments.length} 个] ${fileNames.join('，')}` : `[文件 ${parsed.fileAttachments.length} 个]`);
+    }
+    if (Array.isArray(parsed.imageKeys) && parsed.imageKeys.length > 0) {
+      lines.push(`[图片 ${parsed.imageKeys.length} 张]`);
+    }
+    return compactText(lines.join('\n'), 1200);
+  }
+  if (type === 'file') {
+    const parsed = parseFileMessageContent(rawContent);
+    const lines = [];
+    if (parsed.fileName) lines.push(`文件：${parsed.fileName}`);
+    if (parsed.text) lines.push(`附带文字：${parsed.text}`);
+    return compactText(lines.join('\n'), 1200);
+  }
+  if (type === 'audio') {
+    const parsed = parseAudioMessageContent(rawContent);
+    const durationText = formatDurationFromMs(parsed.durationMs);
+    return durationText ? `[语音消息 ${durationText}]` : '[语音消息]';
+  }
+  if (type === 'image') {
+    return '[图片消息]';
+  }
+  return '';
+}
+
+function buildQuotedMessageContextBlock(messageItem = {}) {
+  const messageType = String(messageItem?.msg_type || messageItem?.message_type || '').trim().toLowerCase();
+  const rawContent = String(messageItem?.body?.content || messageItem?.content || '').trim();
+  const summary = summarizeFeishuMessageContent(messageType, rawContent);
+  if (!summary) return { promptText: '', historyText: '' };
+  const senderSummary = buildSenderIdentitySummary(extractMessageSenderIdentity(messageItem), { includeType: true });
+  const lines = [
+    '这是用户当前消息里引用/回复的上一条消息，请一并参考：',
+  ];
+  if (senderSummary) lines.push(`引用消息发送者：${senderSummary}`);
+  if (messageType) lines.push(`引用消息类型：${messageType}`);
+  lines.push('引用消息内容：');
+  lines.push(summary);
+  return {
+    promptText: lines.join('\n'),
+    historyText: compactText(
+      [
+        `[引用${messageType ? ` ${messageType}` : ''}]`,
+        senderSummary ? `发送者：${senderSummary}` : '',
+        summary,
+      ].filter(Boolean).join(' '),
+      800
+    ),
+  };
 }
 
 function extractMentionOpenId(mention) {
@@ -1438,15 +1953,10 @@ function buildConversationScope(chatID, chatType, senderOpenID, messageID = '') 
       kind: 'p2p',
     };
   }
-
-  const sender = String(senderOpenID || '').trim();
-  const fallbackMessage = String(messageID || '').trim();
-  const senderKey = sender || (fallbackMessage ? `message:${fallbackMessage}` : 'unknown_sender');
-  const scoped = `${chat}::${senderKey}`;
   return {
-    key: scoped,
-    stateKey: scoped,
-    kind: sender ? 'group_sender' : 'group_message_fallback',
+    key: chat,
+    stateKey: chat,
+    kind: 'group_chat',
   };
 }
 
@@ -1467,7 +1977,15 @@ function hasExplicitBotMentionInMessage(message, mentionAliases = [], botOpenId 
   return Boolean(detectTextualBotMention(normalizedMessageText, mentionAliases));
 }
 
-function buildDispatchEnvelope(data, { mentionAliases = [], botOpenId = '', recentMentionedSenders = null } = {}) {
+function shouldRequireMentionForMessage(messageType, parsedPost = null) {
+  return true;
+}
+
+function buildDispatchEnvelope(data, {
+  mentionAliases = [],
+  botOpenId = '',
+  recentTextInputs = null,
+} = {}) {
   const eventData = data || {};
   const message = eventData?.message || {};
   const chatID = String(message.chat_id || '').trim();
@@ -1477,74 +1995,138 @@ function buildDispatchEnvelope(data, { mentionAliases = [], botOpenId = '', rece
   const messageType = String(message.message_type || '').trim().toLowerCase();
   const now = Date.now();
   const conversationScope = buildConversationScope(chatID, chatType, senderOpenID, messageID);
+  const parsedPost = messageType === 'post' ? parsePostContent(message.content || '') : null;
   const explicitBotMention = hasExplicitBotMentionInMessage(message, mentionAliases, botOpenId);
+  const parsedText = messageType === 'text' ? parseMessageText(message.content || '') : '';
+  const normalizedText = messageType === 'text'
+    ? normalizeIncomingText(parsedText, message.mentions || [], mentionAliases)
+    : '';
+  const mentionRequired = shouldRequireMentionForMessage(messageType, parsedPost);
 
   let allowMentionCarry = false;
-  if (isGroupChat(chatType)) {
-    if (explicitBotMention && senderOpenID && recentMentionedSenders) {
-      const parsedText = messageType === 'text' ? parseMessageText(message.content || '') : '';
-      const parsedPost = messageType === 'post' ? parsePostContent(message.content || '') : { text: '' };
-      const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
-      const textMentionAlias = detectTextualBotMention(normalizedMessageText, mentionAliases);
-      rememberRecentMention(recentMentionedSenders, chatID, senderOpenID, textMentionAlias, now);
-    } else if (
-      recentMentionedSenders
-      && senderOpenID
-      && isCarryEligibleMessageType(messageType)
-    ) {
-      pruneMentionCarryState(recentMentionedSenders, now);
-      allowMentionCarry = Boolean(getRecentMentionState(recentMentionedSenders, chatID, senderOpenID, now));
+  let recentTextInput = null;
+  if (recentTextInputs) {
+    pruneRecentTextCarryState(recentTextInputs, now);
+    if (messageType === 'text' && (shouldStoreTextForAttachmentCarry(normalizedText) || explicitBotMention)) {
+      rememberRecentTextCarry(recentTextInputs, {
+        chatID,
+        chatType,
+        senderOpenID,
+        messageID,
+        text: normalizedText,
+        explicitBotMention,
+        now,
+      });
+    } else if (isCarryEligibleMessageType(messageType)) {
+      recentTextInput = getRecentTextCarry(recentTextInputs, {
+        chatID,
+        chatType,
+        senderOpenID,
+        messageID,
+        now,
+      });
+      allowMentionCarry = Boolean(recentTextInput?.explicitBotMention) && mentionRequired;
     }
   }
 
   return {
     taskKey: conversationScope.key || chatID || messageID || 'unknown',
-    shouldSupersedeActiveTask: !isGroupChat(chatType) || explicitBotMention,
+    shouldSupersedeActiveTask: !isGroupChat(chatType)
+      || explicitBotMention
+      || allowMentionCarry
+      || Boolean(recentTextInput),
     payload: {
       eventData,
       dispatchMeta: {
         explicitBotMention,
         allowMentionCarry,
+        mentionRequired,
+        allowTextCarry: Boolean(recentTextInput),
+        recentText: recentTextInput?.text || '',
+        recentTextMessageID: recentTextInput?.messageID || '',
         receivedAt: now,
       },
     },
   };
 }
 
-function buildMentionCarryKey(chatID, senderOpenID) {
+function buildRecentTextCarryKey(chatID, chatType, senderOpenID, messageID = '') {
   const chat = String(chatID || '').trim();
+  if (!chat) return '';
   const sender = String(senderOpenID || '').trim();
-  if (!chat || !sender) return '';
-  return `${chat}:${sender}`;
+  if (!isGroupChat(chatType)) {
+    return sender || chat;
+  }
+  if (sender) return `${chat}:${sender}`;
+  const fallbackMessage = String(messageID || '').trim();
+  return fallbackMessage ? `${chat}:message:${fallbackMessage}` : '';
 }
 
-function pruneMentionCarryState(stateMap, now = Date.now()) {
+function pruneRecentTextCarryState(stateMap, now = Date.now()) {
   if (!stateMap || typeof stateMap.size !== 'number' || stateMap.size === 0) return;
   for (const [key, value] of stateMap.entries()) {
-    if (!value || now - value.timestamp > FEISHU_GROUP_MENTION_CARRY_WINDOW_MS) {
+    if (!value || now - value.timestamp > FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS) {
       stateMap.delete(key);
     }
   }
 }
 
-function rememberRecentMention(stateMap, chatID, senderOpenID, alias = '', now = Date.now()) {
-  const key = buildMentionCarryKey(chatID, senderOpenID);
-  if (!key) return;
+function shouldStoreTextForAttachmentCarry(text = '') {
+  const normalized = compactText(String(text || ''), 4000).trim();
+  if (!normalized) return false;
+  if (/^\//.test(normalized)) return false;
+  return true;
+}
+
+function rememberRecentTextCarry(stateMap, {
+  chatID = '',
+  chatType = '',
+  senderOpenID = '',
+  messageID = '',
+  text = '',
+  explicitBotMention = false,
+  now = Date.now(),
+} = {}) {
+  const key = buildRecentTextCarryKey(chatID, chatType, senderOpenID, messageID);
+  const normalizedText = compactText(String(text || ''), 4000).trim();
+  const normalizedExplicitMention = Boolean(explicitBotMention);
+  if (!key || (!normalizedText && !normalizedExplicitMention)) return;
   stateMap.set(key, {
     timestamp: now,
-    alias: String(alias || '').trim(),
+    messageID: String(messageID || '').trim(),
+    text: normalizedText,
+    explicitBotMention: normalizedExplicitMention,
   });
 }
 
-function getRecentMentionState(stateMap, chatID, senderOpenID, now = Date.now()) {
-  const key = buildMentionCarryKey(chatID, senderOpenID);
+function getRecentTextCarry(stateMap, {
+  chatID = '',
+  chatType = '',
+  senderOpenID = '',
+  messageID = '',
+  now = Date.now(),
+} = {}) {
+  const key = buildRecentTextCarryKey(chatID, chatType, senderOpenID, messageID);
   if (!key) return null;
   const cached = stateMap.get(key);
   if (!cached) return null;
-  if (now - cached.timestamp > FEISHU_GROUP_MENTION_CARRY_WINDOW_MS) {
+  if (now - cached.timestamp > FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS) {
     stateMap.delete(key);
     return null;
   }
+  return cached;
+}
+
+function consumeRecentTextCarry(stateMap, {
+  chatID = '',
+  chatType = '',
+  senderOpenID = '',
+  messageID = '',
+} = {}) {
+  const key = buildRecentTextCarryKey(chatID, chatType, senderOpenID, messageID);
+  if (!key) return null;
+  const cached = stateMap.get(key) || null;
+  if (cached) stateMap.delete(key);
   return cached;
 }
 
@@ -1570,6 +2152,37 @@ function sanitizeLocalFileName(rawName, fallback = 'attachment.bin') {
     .trim();
   if (!cleaned || cleaned === '.' || cleaned === '..') return fallback;
   return cleaned.slice(0, 180);
+}
+
+function buildIncomingAttachmentDir(accountName = '', messageType = '', messageID = '') {
+  const safeAccount = sanitizeLocalFileName(String(accountName || 'default').trim() || 'default', 'default');
+  const safeType = sanitizeLocalFileName(String(messageType || 'attachment').trim() || 'attachment', 'attachment');
+  const dateText = new Date().toISOString().slice(0, 10);
+  const safeMessageID = sanitizeLocalFileName(String(messageID || '').trim() || `${Date.now()}`, 'message');
+  return path.join(FEISHU_INCOMING_ATTACHMENT_DIR, safeAccount, 'incoming', dateText, safeType, safeMessageID);
+}
+
+function buildUniqueFilePath(dirPath, rawName, fallback = 'attachment.bin') {
+  const safeName = sanitizeLocalFileName(rawName, fallback);
+  const ext = path.extname(safeName);
+  const base = path.basename(safeName, ext) || 'attachment';
+  let candidate = path.join(dirPath, safeName);
+  let seq = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(dirPath, `${base}-${seq}${ext}`);
+    seq += 1;
+  }
+  return {
+    filePath: candidate,
+    fileName: path.basename(candidate),
+  };
+}
+
+function formatDownloadRelativePath(filePath = '') {
+  const resolved = path.resolve(String(filePath || ''));
+  const relative = path.relative(os.homedir(), resolved);
+  if (!relative || relative.startsWith('..')) return resolved;
+  return relative.split(path.sep).join('/');
 }
 
 function formatBytes(bytes) {
@@ -2675,33 +3288,33 @@ function buildDocProgressEntryBlocks(entry) {
   if (!entry) return [];
   const timestamp = formatProgressTimestamp(entry.at || Date.now());
   if (entry.kind === 'detail') {
-    const blocks = [];
-    const heading = buildDocHeadingBlock(3, `[${timestamp}] ${entry.title}`);
-    if (heading) blocks.push(heading);
+    const lines = [];
+    const title = normalizeProgressSnippet(entry.title, 200) || '进度事件';
+    lines.push(`[${timestamp}] ${title}`);
+
     for (const item of entry.meta || []) {
-      const block = buildDocKeyValueBlock(item.label, item.value, { inlineCode: item.inlineCode });
-      if (block) blocks.push(block);
+      const label = normalizeProgressSnippet(item?.label, 80);
+      const value = normalizeProgressDetailText(item?.value, 1200);
+      if (!label || !value) continue;
+      lines.push(`${label}：${value}`);
     }
+
     for (const section of entry.sections || []) {
-      if (section.label) {
-        const labelBlock = buildDocTextBlockFromElements([
-          buildDocTextElement(`${section.label}：`, { bold: true }),
-        ]);
-        blocks.push(labelBlock);
-      }
-      const contentBlocks = section.format === 'code'
-        ? buildDocCodeBlocks(section.content)
-        : buildDocTextBlocks(section.content);
-      blocks.push(...contentBlocks);
+      const label = normalizeProgressSnippet(section?.label, 120);
+      const content = normalizeProgressDetailText(section?.content, 16000);
+      if (!content) continue;
+      if (label) lines.push(`${label}：`);
+      lines.push(content);
     }
-    return blocks;
+
+    const body = normalizeProgressDetailText(entry.body, 16000);
+    if (body) lines.push(body);
+    return buildDocRawTextBlocks(lines.join('\n'), 1200);
   }
-  return [
-    buildDocTextBlockFromElements([
-      buildDocTextElement(`[${timestamp}] `, { bold: true }),
-      buildDocTextElement(entry.text),
-    ]),
-  ];
+
+  const text = normalizeProgressSnippet(entry.text, 500);
+  if (!text) return [];
+  return buildDocRawTextBlocks(`[${timestamp}] ${text}`, 1200);
 }
 
 function normalizeCommandText(text) {
@@ -2749,6 +3362,86 @@ function parseThreadCommand(text) {
   }
 
   return { type: 'help' };
+}
+
+function parseThingsCommand(text) {
+  const raw = normalizeCommandText(text);
+  if (!raw) return null;
+
+  if (/^\/things$/i.test(raw)) {
+    return { type: 'list', raw };
+  }
+
+  const createMatch = raw.match(/^\/things\s+new(?:\s+(.+))?$/i);
+  if (createMatch) {
+    const requirement = compactText(String(createMatch[1] || ''), 2000).trim();
+    if (requirement) {
+      return { type: 'create', raw, requirement };
+    }
+    return { type: 'ignore', raw, reason: 'missing_requirement' };
+  }
+
+  if (raw.includes('/things')) {
+    return { type: 'ignore', raw, reason: 'non_command_match' };
+  }
+
+  return null;
+}
+
+function buildThingsCommandHint(command) {
+  if (!command) return '';
+
+  const lines = [
+    '/things 最高优先级命令规则：',
+    '1. 只有用户最新消息严格等于 /things，才表示显示所有事项列表。',
+    '2. 只有用户最新消息以 /things new 开头，且 new 后面带了明确创建要求，才表示创建新事情。',
+    '3. 其他任何消息，即使包含 /things 或 /things new，也都绝对不要当成事项命令，必须按普通消息继续处理。',
+  ];
+
+  if (command.type === 'list') {
+    lines.push('当前判定：这是单独的 /things 命令，请按“显示所有事项列表”处理。');
+  } else if (command.type === 'create') {
+    lines.push(`当前判定：这是有效的 /things new 命令，请按“创建新事情”处理。创建要求：${command.requirement}`);
+  } else {
+    lines.push('当前判定：这条消息不符合 /things 命令格式，不要显示事项列表，也不要创建新事情。');
+  }
+
+  return lines.join('\n');
+}
+
+function buildThingsCommandGuardedUserText(userText, command) {
+  const raw = compactText(String(userText || ''), 4000).trim() || '(空)';
+  if (!command) return raw;
+
+  if (command.type === 'ignore') {
+    return [
+      '系统补充说明：这条消息不是 /things 命令。',
+      '绝对不要显示事项列表，绝对不要创建新事情，绝对不要把消息里的 /things 或 /things new 当成命令执行。',
+      '如果用户是在讨论 /things 规则、引用命令字符串，或顺带提到它，就按普通自然语言需求处理。',
+      '原始用户消息：',
+      raw,
+    ].join('\n');
+  }
+
+  if (command.type === 'list') {
+    return [
+      '系统补充说明：这条消息就是单独的 /things 命令。',
+      '请按“显示所有事项列表”处理，不要把它理解成讨论命令规则。',
+      '原始用户消息：',
+      raw,
+    ].join('\n');
+  }
+
+  if (command.type === 'create') {
+    return [
+      '系统补充说明：这条消息是有效的 /things new 命令。',
+      '请按“创建新事情”处理，创建要求就是 new 后面的正文。',
+      '原始用户消息：',
+      raw,
+    ].join('\n');
+  }
+
+  return raw;
 }
 
 function makeThread(threadId, name = '') {
@@ -2934,6 +3627,18 @@ function buildFeishuReplyInstructions() {
   ].join('\n');
 }
 
+function buildLocalModelReplyInstructions() {
+  return [
+    '回复要求：',
+    '1. 直接输出给用户的最终回复正文，不要加空话，不要承诺稍后回复。',
+    '2. 不要暴露思维链，不要输出 <think>、Thinking Process 或类似内容。',
+    '3. 不要声称你已经读取了本机文件、执行了命令、查看了图片，除非这些信息已经明确写在用户消息文本里。',
+    '4. 如果任务需要本机权限、命令执行、修改代码、调用 Skills、调用 MCP 或访问工作区，请不要自己编造执行结果。',
+    '5. 遇到这类任务时，只输出一条委托指令，格式必须是：[[CODEX_DELEGATE: 给 codex 的明确任务说明]]。',
+    '6. 如果当前信息不足，请直接说缺什么，并给出最简洁的下一步建议。',
+  ].join('\n');
+}
+
 let cachedCodexStateDbPath = '';
 
 function resolveCodexStateDbPath() {
@@ -3047,6 +3752,7 @@ function buildCodexPrompt({
   threadTitle = '',
   forceExecution = false,
   memoryBundleText = '',
+  thingsCommandHint = '',
 }) {
   const lines = [];
   const message = compactText(String(userText || ''), 2400);
@@ -3070,6 +3776,10 @@ function buildCodexPrompt({
     lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
     lines.push(memoryBundleText);
   }
+  if (thingsCommandHint) {
+    lines.push('');
+    lines.push(thingsCommandHint);
+  }
   lines.push('');
   lines.push('当前线程近期上下文：');
   lines.push(renderedHistory || '(无)');
@@ -3082,8 +3792,38 @@ function buildCodexPrompt({
   lines.push('');
   lines.push(buildFeishuReplyInstructions());
   if (cwd) {
-    lines.push('如果用户发送了文件，消息正文里会给出本地临时路径；需要时请直接读取该文件。');
+    lines.push('如果用户发送了文件或图片，消息正文里会给出本地下载路径；需要时请直接读取这些本地文件。');
   }
+  return lines.join('\n').trim();
+}
+
+function buildLocalModelPrompt({
+  systemPrompt,
+  history,
+  userText,
+  imageCount = 0,
+  memoryBundleText = '',
+}) {
+  const lines = [];
+  const message = compactText(String(userText || ''), 2400);
+  const renderedHistory = renderPromptHistory(history);
+  lines.push(systemPrompt || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT);
+  if (memoryBundleText) {
+    lines.push('');
+    lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
+    lines.push(memoryBundleText);
+  }
+  lines.push('');
+  lines.push('当前线程近期上下文：');
+  lines.push(renderedHistory || '(无)');
+  lines.push('');
+  lines.push('用户最新消息：');
+  lines.push(message || '(空)');
+  if (imageCount > 0) {
+    lines.push(`附加图片：${imageCount} 张（当前本地模型接入只支持文本，不要假装看过图片内容）。`);
+  }
+  lines.push('');
+  lines.push(buildLocalModelReplyInstructions());
   return lines.join('\n').trim();
 }
 
@@ -3092,6 +3832,7 @@ function buildCodexResumePrompt({
   imageCount = 0,
   forceExecution = false,
   memoryBundleText = '',
+  thingsCommandHint = '',
 }) {
   const lines = [];
   const message = compactText(String(userText || ''), 2400);
@@ -3104,6 +3845,10 @@ function buildCodexResumePrompt({
     lines.push('');
     lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
     lines.push(memoryBundleText);
+  }
+  if (thingsCommandHint) {
+    lines.push('');
+    lines.push(thingsCommandHint);
   }
   lines.push('');
   lines.push('用户最新消息：');
@@ -3131,6 +3876,43 @@ function shouldBypassCodexSandbox(sandbox, approvalPolicy) {
     && String(approvalPolicy || '').trim() === 'never';
 }
 
+function extractCodexDelegateDirective(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) {
+    return {
+      hasDirective: false,
+      delegatedPrompt: '',
+      remainingText: '',
+    };
+  }
+
+  const blockPattern = /\[\[CODEX_DELEGATE\]\]([\s\S]*?)\[\[\/CODEX_DELEGATE\]\]/i;
+  const blockMatch = text.match(blockPattern);
+  if (blockMatch) {
+    return {
+      hasDirective: true,
+      delegatedPrompt: String(blockMatch[1] || '').trim(),
+      remainingText: text.replace(blockMatch[0], '').trim(),
+    };
+  }
+
+  const inlinePattern = /\[\[CODEX_DELEGATE:\s*([\s\S]*?)\s*\]\]/i;
+  const inlineMatch = text.match(inlinePattern);
+  if (inlineMatch) {
+    return {
+      hasDirective: true,
+      delegatedPrompt: String(inlineMatch[1] || '').trim(),
+      remainingText: text.replace(inlineMatch[0], '').trim(),
+    };
+  }
+
+  return {
+    hasDirective: false,
+    delegatedPrompt: '',
+    remainingText: text,
+  };
+}
+
 function runCodexExec({
   bin,
   model,
@@ -3150,6 +3932,7 @@ function runCodexExec({
   return new Promise((resolve, reject) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-codex-'));
     const outputFile = path.join(tempDir, 'last-message.txt');
+    let settled = false;
 
     const resumeId = String(resumeSessionId || '').trim();
     const bypassSandbox = shouldBypassCodexSandbox(sandbox, approvalPolicy);
@@ -3179,6 +3962,8 @@ function runCodexExec({
     args.push('-');
 
     const childEnv = { ...process.env };
+    childEnv.HOME = process.env.HOME || os.homedir();
+    childEnv.CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     const resolvedApiKey = String(apiKey || '').trim();
     if (resolvedApiKey) {
       childEnv.OPENAI_API_KEY = resolvedApiKey;
@@ -3202,6 +3987,24 @@ function runCodexExec({
     let stdout = '';
     let stdoutJsonBuffer = '';
     let observedThreadId = resumeId;
+
+    function cleanupTempDir() {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+
+    function settleReject(err) {
+      if (settled) return;
+      settled = true;
+      cleanupTempDir();
+      reject(err);
+    }
+
+    function settleResolve(result) {
+      if (settled) return;
+      settled = true;
+      cleanupTempDir();
+      resolve(result);
+    }
 
     function emitEvent(evt) {
       if (!onEvent) return;
@@ -3249,35 +4052,55 @@ function runCodexExec({
     });
 
     child.on('error', (err) => {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-      reject(new Error(`codex spawn failed: ${err.message}`));
+      settleReject(new Error(`codex spawn failed: ${err.message}`));
     });
 
     child.on('close', (code, signal) => {
+      if (settled) return;
       if (stdoutJsonBuffer.trim()) flushJsonLine(stdoutJsonBuffer.trim());
 
       if (code !== 0) {
         const details = compactText(stderr || stdout || `exit=${code}, signal=${signal || ''}`, 1200);
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        reject(new Error(`codex exec failed: ${details}`));
+        settleReject(new Error(`codex exec failed: ${details}`));
         return;
       }
 
       try {
         const reply = fs.readFileSync(outputFile, 'utf8');
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        resolve({
+        settleResolve({
           reply,
           threadId: observedThreadId,
         });
       } catch (err) {
-        fs.rmSync(tempDir, { recursive: true, force: true });
-        reject(new Error(`read codex output failed: ${err.message}`));
+        settleReject(new Error(`read codex output failed: ${err.message}`));
       }
     });
 
-    child.stdin.write(prompt);
-    child.stdin.end();
+    child.stdin.on('error', (err) => {
+      const code = String(err?.code || '').trim();
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+        stderr = compactText(
+          [stderr, `stdin ${code}: ${err.message}`].filter(Boolean).join('\n'),
+          4000
+        );
+        return;
+      }
+      settleReject(new Error(`codex stdin failed: ${err.message}`));
+    });
+
+    try {
+      child.stdin.end(prompt);
+    } catch (err) {
+      const code = String(err?.code || '').trim();
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+        stderr = compactText(
+          [stderr, `stdin ${code}: ${err.message}`].filter(Boolean).join('\n'),
+          4000
+        );
+      } else {
+        settleReject(new Error(`codex stdin failed: ${err.message}`));
+      }
+    }
   });
 }
 
@@ -3290,12 +4113,18 @@ async function generateCodexReply({
   threadTitle = '',
   forceExecution = false,
   memoryBundleText = '',
+  thingsCommandHint = '',
   onSpawn = null,
   onProgressEvent = null,
+  throwIfCancelled = null,
 }) {
   let resolvedSessionId = String(sessionId || '').trim();
   const imageCount = Array.isArray(imagePaths) ? imagePaths.length : 0;
+  const ensureNotCancelled = typeof throwIfCancelled === 'function'
+    ? throwIfCancelled
+    : () => {};
   const runExec = async ({ prompt, resumeSessionId = '' }) => {
+    ensureNotCancelled();
     return runCodexExec({
       bin: codex.bin,
       model: codex.model,
@@ -3331,7 +4160,13 @@ async function generateCodexReply({
   if (resolvedSessionId) {
     try {
       const resumed = await runExec({
-        prompt: buildCodexResumePrompt({ userText, imageCount, forceExecution, memoryBundleText }),
+        prompt: buildCodexResumePrompt({
+          userText,
+          imageCount,
+          forceExecution,
+          memoryBundleText,
+          thingsCommandHint,
+        }),
         resumeSessionId: resolvedSessionId,
       });
       return {
@@ -3339,10 +4174,12 @@ async function generateCodexReply({
         threadId: String(resumed?.threadId || resolvedSessionId),
       };
     } catch (err) {
+      ensureNotCancelled();
       console.error(`codex_resume=error thread_id=${resolvedSessionId} message=${err.message}`);
     }
   }
 
+  ensureNotCancelled();
   const fresh = await runExec({
     prompt: buildCodexPrompt({
       systemPrompt: codex.systemPrompt,
@@ -3354,12 +4191,362 @@ async function generateCodexReply({
       threadTitle,
       forceExecution,
       memoryBundleText,
+      thingsCommandHint,
     }),
   });
 
   return {
     reply: String(fresh?.reply || ''),
     threadId: String(fresh?.threadId || ''),
+  };
+}
+
+function runLocalModelPrompt({
+  localModel,
+  prompt,
+}) {
+  return new Promise((resolve, reject) => {
+    const scriptPath = String(localModel?.promptScript || '').trim();
+    if (!scriptPath) {
+      reject(new Error('local model prompt_script missing'));
+      return;
+    }
+
+    const childEnv = {
+      ...process.env,
+      MAX_KV_SIZE: String(localModel.maxKvSize || 1024),
+      MAX_TOKENS: String(localModel.maxTokens || 384),
+      TEMP: String(localModel.temp ?? 0.2),
+      SYSTEM_PROMPT: String(localModel.systemPrompt || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT),
+    };
+    if (String(localModel.model || '').trim()) {
+      childEnv.MODEL = String(localModel.model || '').trim();
+    }
+
+    const child = spawn('/bin/bash', [scriptPath, String(prompt || '')], {
+      cwd: localModel.cwd || process.cwd(),
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (buf) => {
+      stdout = `${stdout}${String(buf || '')}`;
+      if (stdout.length > 24000) stdout = stdout.slice(-24000);
+    });
+
+    child.stderr.on('data', (buf) => {
+      stderr = `${stderr}${String(buf || '')}`;
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+
+    child.on('error', (err) => {
+      reject(new Error(`local model spawn failed: ${err.message}`));
+    });
+
+    child.on('close', (code, signal) => {
+      if (code !== 0) {
+        const details = compactText(stderr || stdout || `exit=${code}, signal=${signal || ''}`, 1200);
+        reject(new Error(`local model prompt failed: ${details}`));
+        return;
+      }
+      resolve(String(stdout || ''));
+    });
+  });
+}
+
+async function generateLocalModelReply({
+  localModel,
+  history,
+  userText,
+  imagePaths = [],
+  memoryBundleText = '',
+}) {
+  const reply = await requestLocalModelReply({
+    localModel,
+    history,
+    userText,
+    imagePaths,
+    memoryBundleText,
+  });
+  return {
+    reply: String(reply || ''),
+  };
+}
+
+async function requestLocalModelServer({
+  localModel,
+  messages,
+}) {
+  const baseUrl = String(localModel?.serverBaseUrl || '').trim().replace(/\/+$/, '');
+  if (!baseUrl) {
+    throw new Error('local model server_base_url missing');
+  }
+  if (typeof fetch !== 'function') {
+    throw new Error('global fetch is not available in this node runtime');
+  }
+  const controller = new AbortController();
+  const timeoutMs = Number(localModel?.requestTimeoutMs || 180000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const body = {
+      messages,
+      temperature: Number(localModel?.temp ?? 0.2),
+      max_tokens: Number(localModel?.maxTokens || 256),
+      stream: false,
+      chat_template_kwargs: {
+        enable_thinking: false,
+      },
+    };
+    if (String(localModel?.model || '').trim()) {
+      body.model = String(localModel.model || '').trim();
+    }
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      data = null;
+    }
+    if (!response.ok) {
+      throw new Error(`status=${response.status} body=${compactText(raw || '', 800)}`);
+    }
+    const choice = Array.isArray(data?.choices) ? data.choices[0] : null;
+    const message = choice?.message || {};
+    const content = message?.content;
+    if (typeof content === 'string' && content.trim()) {
+      return content.trim();
+    }
+    if (Array.isArray(content)) {
+      const text = content
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item.text === 'string') return item.text;
+          if (item && typeof item.content === 'string') return item.content;
+          return '';
+        })
+        .join('')
+        .trim();
+      if (text) return text;
+    }
+    throw new Error('local model server returned empty content');
+  } catch (err) {
+    if (String(err?.name || '') === 'AbortError') {
+      throw new Error(`local model server timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function requestLocalModelReply({
+  localModel,
+  history,
+  userText,
+  imagePaths = [],
+  memoryBundleText = '',
+}) {
+  const messages = [];
+  if (localModel.systemPrompt) {
+    messages.push({ role: 'system', content: localModel.systemPrompt });
+  }
+  if (memoryBundleText) {
+    messages.push({
+      role: 'system',
+      content: `本地记忆（按机器人独立存储，跨线程共享）：\n${memoryBundleText}`,
+    });
+  }
+  for (const item of history || []) {
+    const role = String(item?.role || '').trim().toLowerCase() === 'assistant' ? 'assistant' : 'user';
+    const text = compactText(String(item?.text || '').trim(), 2400);
+    if (!text) continue;
+    messages.push({ role, content: text });
+  }
+  const userLines = [compactText(String(userText || '').trim(), 2400) || '(空)'];
+  if (Array.isArray(imagePaths) && imagePaths.length > 0) {
+    userLines.push(`附加图片：${imagePaths.length} 张（当前本地模型接入只支持文本，不要假装看过图片内容）。`);
+  }
+  messages.push({
+    role: 'user',
+    content: userLines.join('\n'),
+  });
+
+  if (String(localModel.serverBaseUrl || '').trim()) {
+    try {
+      return await requestLocalModelServer({
+        localModel,
+        messages,
+      });
+    } catch (err) {
+      console.error(`local_model_server=error message=${err.message}`);
+      if (!String(localModel.promptScript || '').trim()) {
+        throw err;
+      }
+    }
+  }
+
+  const prompt = buildLocalModelPrompt({
+    systemPrompt: localModel.systemPrompt,
+    history,
+    userText,
+    imageCount: Array.isArray(imagePaths) ? imagePaths.length : 0,
+    memoryBundleText,
+  });
+  return runLocalModelPrompt({
+    localModel,
+    prompt,
+  });
+}
+
+function shouldDelegateToCodexInLocalModel(rawText = '') {
+  const text = String(rawText || '').trim();
+  if (!text) return false;
+  if (/^\/codex\b/i.test(text)) return true;
+  if (/(调用\s*codex|用\s*codex|交给\s*codex|让\s*codex|run\s+codex|use\s+codex)/i.test(text)) {
+    return true;
+  }
+  if (/(skills?\b|skill\b|mcp\b|本机|工作区|workspace|终端|shell|命令行|读文件|读取文件|打开文件|目录|文件夹|运行命令|执行命令|调用工具|工具调用)/i.test(text)) {
+    return true;
+  }
+  return shouldForceCodexExecution(text);
+}
+
+function extractFirstJsonObject(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return null;
+
+  const candidates = [];
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch?.[1]) {
+    candidates.push(fenceMatch[1].trim());
+  }
+  candidates.push(text);
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(text.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of uniqueStrings(candidates.filter(Boolean))) {
+    try {
+      return JSON.parse(candidate);
+    } catch (_) {
+      // keep trying
+    }
+  }
+  return null;
+}
+
+function buildScheduledTaskIntentJudgePrompt({ text, pending = null, tasksSummary = '' }) {
+  const lines = [
+    '你是一个严格的意图分类器，只判断用户这条消息现在是否在管理“定时任务”。',
+    '可识别意图只有：create、list、run_now、enable、disable、update_time、update_target。',
+    '定时任务既可能是“昨日店铺报告”，也可能是“运行某个 skill 的定时任务”。',
+    '如果用户是在继续别的正常任务、纠正误匹配、表示“都不是/不是这个意思/继续刚才任务/不用管定时任务”，就判定 should_handle=false；如果当前有 pending，请同时 exit_pending=true。',
+    '如果拿不准，也返回 should_handle=false。',
+    '只输出单行 JSON，不要解释，不要 markdown。',
+    'JSON 结构：{"should_handle":boolean,"intent":"create|list|run_now|enable|disable|update_time|update_target|continue|unknown","confidence":0-1,"exit_pending":boolean}',
+    '',
+    `当前 pending：${pending ? safeJsonStringify(pending, 1200) : '(none)'}`,
+    '现有任务：',
+    tasksSummary || '(none)',
+    '',
+    '用户消息：',
+    compactText(String(text || ''), 1200) || '(empty)',
+  ];
+  return lines.join('\n');
+}
+
+async function judgeScheduledTaskIntentWithCodex(codex, payload = {}) {
+  const prompt = buildScheduledTaskIntentJudgePrompt(payload);
+  const result = await runCodexExec({
+    bin: codex.bin,
+    model: codex.model,
+    reasoningEffort: 'low',
+    profile: codex.profile,
+    cwd: codex.cwd,
+    addDirs: codex.addDirs,
+    sandbox: codex.sandbox,
+    approvalPolicy: codex.approvalPolicy,
+    apiKey: codex.apiKey,
+    prompt,
+    imagePaths: [],
+  });
+  const parsed = extractFirstJsonObject(result?.reply || '');
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error(`intent judge returned non-json: ${compactText(result?.reply || '', 200)}`);
+  }
+  return parsed;
+}
+
+function buildBusyTargetKeysFromIncomingMessage({
+  channelType = 'feishu',
+  chatID = '',
+  chatType = '',
+  threadID = '',
+  senderOpenID = '',
+}) {
+  if (normalizeChannelType(channelType) !== 'feishu') return [];
+  const keys = [];
+  const chat = normalizeString(chatID);
+  const thread = normalizeString(threadID);
+  const sender = normalizeString(senderOpenID);
+
+  if (chat) {
+    keys.push(`feishu:chat:${chat}`);
+    if (thread) {
+      keys.push(`feishu:thread:${chat}:${thread}`);
+    }
+  }
+  if (!isGroupChat(chatType) && sender) {
+    keys.push(`feishu:user:${sender}`);
+  }
+  return uniqueStrings(keys);
+}
+
+function buildBusyTargetKeysFromTaskTarget(task = {}) {
+  if (normalizeChannelType(task.channel_type || task.channelType) !== 'feishu') return [];
+  const targetType = normalizeTargetType(task.target_type || task.targetType);
+  const targetID = normalizeString(task.target_id || task.targetId);
+  const threadID = normalizeString(task.thread_id || task.threadId);
+  if (!targetType || !targetID) return [];
+  if (targetType === 'user') return [`feishu:user:${targetID}`];
+  if (targetType === 'thread') {
+    return uniqueStrings([
+      `feishu:chat:${targetID}`,
+      threadID ? `feishu:thread:${targetID}:${threadID}` : '',
+    ].filter(Boolean));
+  }
+  if (targetType === 'session' || targetType === 'chat') {
+    return [`feishu:chat:${targetID}`];
+  }
+  return [];
+}
+
+function markBusyTargetKeys(busyMap, keys = []) {
+  const activeKeys = uniqueStrings((Array.isArray(keys) ? keys : []).filter(Boolean));
+  for (const key of activeKeys) {
+    busyMap.set(key, Number(busyMap.get(key) || 0) + 1);
+  }
+  return () => {
+    for (const key of activeKeys) {
+      const next = Number(busyMap.get(key) || 0) - 1;
+      if (next > 0) busyMap.set(key, next);
+      else busyMap.delete(key);
+    }
   };
 }
 
@@ -3904,32 +5091,54 @@ function createSilentProgressReporter() {
 async function appendDocTextBlocks(client, documentID, blocks) {
   const children = Array.isArray(blocks) ? blocks.filter(Boolean) : [];
   if (children.length === 0) return [];
-  const created = await client.docx.documentBlockChildren.create({
-    path: {
-      document_id: documentID,
-      // Feishu docx uses the document root block id equal to document_id.
-      block_id: documentID,
-    },
-    data: {
-      children,
-    },
-  });
-  return Array.isArray(created?.data?.children) ? created.data.children : [];
+  const retryDelays = [900, 2200];
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    try {
+      const created = await client.docx.documentBlockChildren.create({
+        path: {
+          document_id: documentID,
+          // Feishu docx uses the document root block id equal to document_id.
+          block_id: documentID,
+        },
+        data: {
+          children,
+        },
+      });
+      return Array.isArray(created?.data?.children) ? created.data.children : [];
+    } catch (err) {
+      if (attempt >= retryDelays.length || !isRetryableFeishuDocWriteError(err)) {
+        throw err;
+      }
+      await sleep(retryDelays[attempt]);
+    }
+  }
+  return [];
 }
 
 async function patchDocTextBlock(client, documentID, blockID, text) {
   if (!documentID || !blockID) return null;
-  return client.docx.documentBlock.patch({
-    path: {
-      document_id: documentID,
-      block_id: blockID,
-    },
-    data: {
-      update_text_elements: {
-        elements: buildDocTextElements(text),
-      },
-    },
-  });
+  const retryDelays = [900, 2200];
+  for (let attempt = 0; attempt <= retryDelays.length; attempt += 1) {
+    try {
+      return await client.docx.documentBlock.patch({
+        path: {
+          document_id: documentID,
+          block_id: blockID,
+        },
+        data: {
+          update_text_elements: {
+            elements: buildDocTextElements(text),
+          },
+        },
+      });
+    } catch (err) {
+      if (attempt >= retryDelays.length || !isRetryableFeishuDocWriteError(err)) {
+        throw err;
+      }
+      await sleep(retryDelays[attempt]);
+    }
+  }
+  return null;
 }
 
 async function queryDocURL(client, documentID) {
@@ -4018,7 +5227,7 @@ function createDocProgressReporter({
 }) {
   const intro = compactText(String(initialMessage || '').trim() || '已接收，开始执行。', 1200);
   const progressDoc = progressConfig?.doc || {};
-  const minInterval = Math.max(500, Number(minUpdateIntervalMs) || 1200);
+  const minInterval = Math.max(5000, Number(minUpdateIntervalMs) || 1200);
   const startedAt = Date.now();
   const stepHistory = [];
   const pendingEntries = [];
@@ -4034,6 +5243,7 @@ function createDocProgressReporter({
   let linkMessageID = '';
   let lastStatusText = '';
   let lastFlushAt = 0;
+  let fallbackNoticeSent = false;
 
   function runSerial(task) {
     const next = queue
@@ -4085,12 +5295,17 @@ function createDocProgressReporter({
     if (!fallbackReporter) {
       clearTimers();
       fallbackReporter = fallbackFactory();
+      const failure = classifyFeishuDocFailure(err);
+      console.error(
+        `progress_doc_fallback=enabled reason=${reason || failure.logReason} type=${failure.type}${failure.permissions.length ? ` permissions=${failure.permissions.join(',')}` : ''}${err ? ` ${describeFeishuApiError(err)}` : ''}`
+      );
       await fallbackReporter.start();
+      if (!fallbackNoticeSent && failure.userNotice) {
+        fallbackNoticeSent = true;
+        await sendTextReplySafe(client, chatID, failure.userNotice, 'progress_doc_fallback_notice');
+      }
       for (const step of stepHistory) {
         fallbackReporter.push(step);
-      }
-      if (reason) {
-        console.error(`progress_doc_fallback=enabled reason=${reason}${err ? ` message=${err.message}` : ''}`);
       }
     }
     return fallbackReporter;
@@ -4145,7 +5360,7 @@ function createDocProgressReporter({
       }
       return true;
     } catch (err) {
-      console.error(`progress_doc_init=error chat_id=${chatID} message=${err.message}`);
+      console.error(`progress_doc_init=error chat_id=${chatID} ${describeFeishuApiError(err)}`);
       await activateFallback('doc_init_failed', err);
       return false;
     }
@@ -4160,7 +5375,7 @@ function createDocProgressReporter({
       lastStatusText = nextStatus;
       return true;
     } catch (err) {
-      console.error(`progress_doc_status=error document_id=${documentID} message=${err.message}`);
+      console.error(`progress_doc_status=error document_id=${documentID} ${describeFeishuApiError(err)}`);
       await activateFallback('doc_status_failed', err);
       return false;
     }
@@ -4181,7 +5396,7 @@ function createDocProgressReporter({
         const blocks = entries.flatMap((entry) => buildDocProgressEntryBlocks(entry));
         await appendDocTextBlocks(client, documentID, blocks);
       } catch (err) {
-        console.error(`progress_doc_append=error document_id=${documentID} message=${err.message}`);
+        console.error(`progress_doc_append=error document_id=${documentID} ${describeFeishuApiError(err)}`);
         await activateFallback('doc_append_failed', err);
         return false;
       }
@@ -4373,12 +5588,12 @@ function createProgressReporter({
   return messageFactory();
 }
 
-async function downloadImageToTempFile(client, messageID, imageKey) {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-image-'));
-  const filePath = path.join(
-    tempDir,
-    `${Date.now()}-${Math.random().toString(16).slice(2)}.jpg`
-  );
+async function downloadImageToDownloads(client, {
+  accountName = '',
+  messageID = '',
+  imageKey = '',
+  fileName = '',
+} = {}) {
   const resource = await client.im.v1.messageResource.get({
     params: {
       type: 'image',
@@ -4388,14 +5603,51 @@ async function downloadImageToTempFile(client, messageID, imageKey) {
       file_key: imageKey,
     },
   });
+  const dirPath = buildIncomingAttachmentDir(accountName, 'image', messageID);
+  fs.mkdirSync(dirPath, { recursive: true });
+  const ext = inferExtensionFromHeaders(resource.headers, '.jpg');
+  const preferredName = fileName
+    ? `${path.basename(String(fileName || '').trim(), path.extname(String(fileName || '').trim())) || 'image'}${ext}`
+    : `image-${messageID || Date.now()}${ext}`;
+  const { filePath, fileName: storedFileName } = buildUniqueFilePath(
+    dirPath,
+    preferredName,
+    `image-${Date.now()}${ext}`
+  );
   await resource.writeFile(filePath);
-  return { tempDir, filePath };
+  return {
+    filePath,
+    fileName: storedFileName,
+    relativePath: formatDownloadRelativePath(filePath),
+  };
 }
 
-async function downloadFileToTempFile(client, messageID, fileKey, fileName = '') {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-file-'));
-  const safeName = sanitizeLocalFileName(fileName, `attachment-${Date.now()}.bin`);
-  const filePath = path.join(tempDir, safeName);
+async function getMessageItemSafe(client, messageID, logTag = 'message_get') {
+  const target = String(messageID || '').trim();
+  if (!target) return null;
+  try {
+    const response = await client.im.v1.message.get({
+      params: {
+        user_id_type: 'open_id',
+      },
+      path: {
+        message_id: target,
+      },
+    });
+    const items = Array.isArray(response?.data?.items) ? response.data.items : [];
+    return items[0] || null;
+  } catch (err) {
+    console.error(`${logTag}=error message_id=${target} message=${err.message}`);
+    return null;
+  }
+}
+
+async function downloadFileToDownloads(client, {
+  accountName = '',
+  messageID = '',
+  fileKey = '',
+  fileName = '',
+} = {}) {
   const resource = await client.im.v1.messageResource.get({
     params: {
       type: 'file',
@@ -4405,8 +5657,20 @@ async function downloadFileToTempFile(client, messageID, fileKey, fileName = '')
       file_key: fileKey,
     },
   });
+  const dirPath = buildIncomingAttachmentDir(accountName, 'file', messageID);
+  fs.mkdirSync(dirPath, { recursive: true });
+  const fallbackExt = inferExtensionFromHeaders(resource.headers, path.extname(fileName || '') || '.bin');
+  const { filePath, fileName: storedFileName } = buildUniqueFilePath(
+    dirPath,
+    fileName || `attachment-${messageID || Date.now()}${fallbackExt}`,
+    `attachment-${Date.now()}${fallbackExt}`
+  );
   await resource.writeFile(filePath);
-  return { tempDir, filePath, fileName: safeName };
+  return {
+    filePath,
+    fileName: storedFileName,
+    relativePath: formatDownloadRelativePath(filePath),
+  };
 }
 
 async function downloadAudioToTempFile(client, messageID, fileKey) {
@@ -4668,14 +5932,18 @@ async function main() {
 
   const creds = resolveCredentials(config);
   const codex = resolveCodexConfig(config);
+  const localModel = resolveLocalModelConfig(config);
   const memory = resolveMemoryConfig(config);
   const speech = resolveSpeechConfig(config, codex);
+  const dailyReport = resolveDailyStoreReportConfig(config, accountName);
   const codexDetect = detectCodex(codex.bin);
+  const localModelDetect = detectLocalModel(localModel);
+  const activeSystemPrompt = replyMode === 'local_model' ? localModel.systemPrompt : codex.systemPrompt;
   const mentionAliases = resolveMentionAliases({
     botName,
     explicitAliases: config.mention_aliases,
     replyPrefix,
-    systemPrompt: codex.systemPrompt,
+    systemPrompt: activeSystemPrompt,
     progressTitlePrefix: progress.doc.titlePrefix,
   });
 
@@ -4734,6 +6002,19 @@ async function main() {
     console.log(`codex_bypass_sandbox=${shouldBypassCodexSandbox(codex.sandbox, codex.approvalPolicy) ? 'true' : 'false'}`);
     console.log(`codex_timeout_sec=${codex.timeoutSec || '(disabled)'}`);
     console.log(`codex_history_turns=${codex.historyTurns}`);
+    console.log(`local_model_cwd=${localModel.cwd || '(missing)'}`);
+    console.log(`local_model_cwd_found=${localModelDetect.cwdFound ? 'true' : 'false'}`);
+    console.log(`local_model_server_base_url=${localModel.serverBaseUrl || '(none)'}`);
+    console.log(`local_model_server_configured=${localModelDetect.serverConfigured ? 'true' : 'false'}`);
+    console.log(`local_model_prompt_script=${localModel.promptScript || '(missing)'}`);
+    console.log(`local_model_prompt_script_found=${localModelDetect.promptScriptFound ? 'true' : 'false'}`);
+    console.log(`local_model_ready=${localModelDetect.ready ? 'true' : 'false'}`);
+    console.log(`local_model_model=${localModel.model || '(script default)'}`);
+    console.log(`local_model_max_kv_size=${localModel.maxKvSize}`);
+    console.log(`local_model_max_tokens=${localModel.maxTokens}`);
+    console.log(`local_model_temp=${localModel.temp}`);
+    console.log(`local_model_request_timeout_ms=${localModel.requestTimeoutMs}`);
+    console.log(`local_model_history_turns=${localModel.historyTurns}`);
     console.log(`memory_enabled=${memory.enabled ? 'true' : 'false'}`);
     console.log(`memory_role_memory_chars=${memory.roleMemory.length}`);
     if (memory.enabled) console.log(`memory_store=${botMemoryStorePath(accountName)}`);
@@ -4745,6 +6026,15 @@ async function main() {
     console.log(`speech_base_url=${speech.baseURL}`);
     console.log(`speech_ffmpeg_bin=${speech.ffmpegBin || '(not found)'}`);
     if (speech.ffmpegVersion) console.log(`speech_ffmpeg_version=${speech.ffmpegVersion}`);
+    console.log(`daily_report_enabled=${dailyReport.enabled ? 'true' : 'false'}`);
+    if (dailyReport.enabled) {
+      console.log(`daily_report_chat_id=${dailyReport.chatId || '(missing)'}`);
+      console.log(`daily_report_schedule=${dailyReport.schedule.label}`);
+      console.log(`daily_report_timezone=${dailyReport.timeZone}`);
+      console.log(`daily_report_store_base_url=${dailyReport.store.baseUrl || '(missing)'}`);
+      console.log(`daily_report_store_email=${dailyReport.store.email || '(missing)'}`);
+      console.log(`daily_report_store_password_found=${dailyReport.store.password ? 'true' : 'false'}`);
+    }
     return;
   }
 
@@ -4753,6 +6043,10 @@ async function main() {
   if (replyMode === 'codex') {
     ensure(codexDetect.found, `codex binary not found: ${codex.bin}`);
   }
+  if (replyMode === 'local_model') {
+    ensure(localModelDetect.cwdFound, `local model cwd not found: ${localModel.cwd || '(missing)'}`);
+    ensure(localModelDetect.promptScriptFound, `local model prompt script not found: ${localModel.promptScript || '(missing)'}`);
+  }
 
   const baseConfig = {
     appId: creds.appId.value,
@@ -4760,26 +6054,58 @@ async function main() {
     domain: domain.value,
   };
   const client = new lark.Client(baseConfig);
+  const busyTargetCounts = new Map();
+  const scheduledJobManager = createScheduledJobManager({
+    accountName,
+    runtimeDir: FEISHU_RUNTIME_DIR,
+    config,
+    codex,
+    feishuDomain: domain.label,
+    feishuCreds: {
+      appId: creds.appId.value,
+      appSecret: creds.appSecret.value,
+      botOpenId: creds.botOpenId.value,
+    },
+    log: (line) => {
+      console.log(line);
+    },
+    intentJudge: async (payload) => {
+      return judgeScheduledTaskIntentWithCodex(codex, payload);
+    },
+    isTargetBusy: (task) => {
+      const keys = buildBusyTargetKeysFromTaskTarget(task);
+      return keys.some((key) => Number(busyTargetCounts.get(key) || 0) > 0);
+    },
+  });
+  scheduledJobManager.start();
 
   const chatStates = new Map();
   const chatRunners = new Map();
-  const recentMentionedSenders = new Map();
+  const recentTextInputs = new Map();
 
   async function handleMessageEvent(data, taskControl = createChatTaskControl('')) {
     const eventData = data?.eventData || data || {};
     const dispatchMeta = data?.dispatchMeta || {};
-    const senderOpenID = eventData?.sender?.sender_id?.open_id || '';
-    const senderType = eventData?.sender?.sender_type || '';
+    const senderIdentity = extractEventSenderIdentity(eventData);
+    const senderOpenID = senderIdentity.openId || '';
+    const senderType = senderIdentity.senderType || '';
     const message = eventData?.message || {};
     const chatID = message.chat_id || '';
     const chatType = String(message.chat_type || '').trim().toLowerCase();
     const messageID = message.message_id || '';
+    const rootID = message.root_id || '';
+    const parentID = message.parent_id || '';
+    const messageThreadID = message.thread_id || '';
     const messageType = message.message_type || '';
     const mentions = Array.isArray(message.mentions) ? message.mentions : [];
     const parsedText = messageType === 'text' ? parseMessageText(message.content || '') : '';
-    const parsedFile = messageType === 'file' ? parseFileMessageContent(message.content || '') : { fileKey: '', fileName: '', fileSize: 0 };
+    const parsedFile = messageType === 'file'
+      ? parseFileMessageContent(message.content || '')
+      : { fileKey: '', fileName: '', fileSize: 0, text: '' };
     const parsedAudio = messageType === 'audio' ? parseAudioMessageContent(message.content || '') : { fileKey: '', durationMs: 0 };
-    const parsedPost = messageType === 'post' ? parsePostContent(message.content || '') : { text: '', imageKeys: [] };
+    const parsedPost = messageType === 'post'
+      ? parsePostContent(message.content || '')
+      : { text: '', imageKeys: [], fileAttachments: [] };
     const normalizedMessageText = messageType === 'post' ? parsedPost.text : parsedText;
     const textMentionAlias = detectTextualBotMention(normalizedMessageText, mentionAliases);
     const mentionMatchedByText = Boolean(textMentionAlias);
@@ -4806,14 +6132,7 @@ async function main() {
     }
     const normalizedImageKeys = uniqueStrings(imageKeys);
     const groupChat = isGroupChat(chatType);
-    pruneMentionCarryState(recentMentionedSenders, now);
-    const recentMentionState = groupChat && !botMentioned && !mentionMatchedByMentionName && !mentionMatchedByText
-      ? getRecentMentionState(recentMentionedSenders, chatID, senderOpenID, now)
-      : null;
-    const mentionMatchedByCarry = Boolean(
-      dispatchMeta.allowMentionCarry
-      || (recentMentionState && isCarryEligibleMessageType(messageType))
-    );
+    const mentionMatchedByCarry = Boolean(dispatchMeta.allowMentionCarry);
 
     console.log('FEISHU_EVENT');
     console.log('event=im.message.receive_v1');
@@ -4833,11 +6152,7 @@ async function main() {
       console.log(`mention_fallback=text_alias alias=${textMentionAlias}`);
     }
     if (mentionMatchedByCarry) {
-      if (recentMentionState?.timestamp) {
-        console.log(`mention_fallback=recent_sender_window age_ms=${now - recentMentionState.timestamp}`);
-      } else {
-        console.log('mention_fallback=queued_sender_window');
-      }
+      console.log(`mention_fallback=recent_text_pair message_id=${dispatchMeta.recentTextMessageID || '(unknown)'}`);
     }
 
     if (!chatID) {
@@ -4860,59 +6175,163 @@ async function main() {
       console.log('skip_reason=unsupported_message_type');
       return;
     }
-    const mentionGateActive = mentionConfig.requireMention && (!mentionConfig.groupOnly || groupChat);
+    const mentionRequired = dispatchMeta.mentionRequired !== false;
+    const mentionGateActive = mentionConfig.requireMention && mentionRequired && (!mentionConfig.groupOnly || groupChat);
     if (mentionGateActive && !botMentioned && !mentionMatchedByMentionName && !mentionMatchedByText && !mentionMatchedByCarry) {
       console.log('skip_reason=require_mention_not_met');
       console.log(`mention_count=${mentions.length}`);
       console.log(`text_has_at=${/[@＠]/.test(String(normalizedMessageText || '')) ? 'true' : 'false'}`);
       return;
     }
-    if (groupChat && senderOpenID && (botMentioned || mentionMatchedByMentionName || mentionMatchedByText)) {
-      rememberRecentMention(recentMentionedSenders, chatID, senderOpenID, textMentionAlias, now);
-    }
+    const quotedMessageIDsFromEvent = extractQuotedMessageIdsFromRawContent(message.content || '');
+    const fallbackQuotedParentID = parentID && (!messageThreadID || parentID !== rootID) ? parentID : '';
+    const currentMessageItem = (quotedMessageIDsFromEvent.length > 0 || fallbackQuotedParentID)
+      ? await getMessageItemSafe(client, messageID, 'current_message_get')
+      : null;
+    const quotedMessageID = uniqueStrings([
+      ...quotedMessageIDsFromEvent,
+      ...extractQuotedMessageIdsFromRawContent(currentMessageItem?.body?.content || ''),
+      String(currentMessageItem?.upper_message_id || '').trim(),
+      String(fallbackQuotedParentID || '').trim(),
+    ]).filter((id) => id && id !== messageID)[0] || '';
+    const quotedMessageItem = quotedMessageID
+      ? await getMessageItemSafe(client, quotedMessageID, 'quoted_message_get')
+      : null;
+    const quotedMessageContext = quotedMessageItem
+      ? buildQuotedMessageContextBlock(quotedMessageItem)
+      : { promptText: '', historyText: '' };
 
     const tempPathsToCleanup = [];
+    const imageAttachments = [];
     const imagePaths = [];
     const fileAttachments = [];
+    const incomingAttachmentFacts = [];
     let userText = '';
     let historyUserText = '';
+    let usedRecentTextCarry = false;
 
     const incomingText = compactText(text, 4000).trim();
+    const carriedText = dispatchMeta.allowTextCarry
+      ? compactText(String(dispatchMeta.recentText || ''), 4000).trim()
+      : '';
+    const fileInlineText = compactText(normalizeIncomingText(parsedFile.text, mentions, mentionAliases), 4000).trim();
+    const fileDescriptors = [];
     if (messageType === 'file') {
       if (!parsedFile.fileKey) {
         console.log('skip_reason=missing_file_key');
         await sendTextReplySafe(client, chatID, '文件接收失败，请重新发送。', 'file_download_reply');
         return;
       }
-      try {
-        const downloaded = await downloadFileToTempFile(client, messageID, parsedFile.fileKey, parsedFile.fileName);
-        fileAttachments.push({
-          fileName: downloaded.fileName,
-          filePath: downloaded.filePath,
-          fileSize: parsedFile.fileSize,
+      fileDescriptors.push({
+        fileKey: parsedFile.fileKey,
+        fileName: parsedFile.fileName,
+        fileSize: parsedFile.fileSize,
+      });
+    }
+    if (messageType === 'post' && Array.isArray(parsedPost.fileAttachments)) {
+      for (const descriptor of parsedPost.fileAttachments) {
+        if (!descriptor?.fileKey) continue;
+        fileDescriptors.push({
+          fileKey: String(descriptor.fileKey || '').trim(),
+          fileName: String(descriptor.fileName || '').trim(),
+          fileSize: Number(descriptor.fileSize) || 0,
         });
-        tempPathsToCleanup.push(downloaded.tempDir);
-      } catch (err) {
-        console.error(`file_download=error key=${parsedFile.fileKey} message=${err.message}`);
+      }
+    }
+
+    if (fileDescriptors.length > 0) {
+      for (const descriptor of fileDescriptors) {
+        try {
+          const downloaded = await downloadFileToDownloads(client, {
+            accountName,
+            messageID,
+            fileKey: descriptor.fileKey,
+            fileName: descriptor.fileName,
+          });
+          fileAttachments.push({
+            fileName: downloaded.fileName,
+            filePath: downloaded.filePath,
+            relativePath: downloaded.relativePath,
+            fileSize: Number(descriptor.fileSize) || 0,
+          });
+          incomingAttachmentFacts.push(`已接收文件：${downloaded.fileName}，保存在 ${downloaded.relativePath}`);
+        } catch (err) {
+          console.error(`file_download=error key=${descriptor.fileKey} message=${err.message}`);
+        }
+      }
+      if (fileAttachments.length === 0) {
         await sendTextReplySafe(client, chatID, '文件下载失败，请稍后重试。', 'file_download_reply');
         return;
       }
+    }
 
-      const file = fileAttachments[0];
-      const lines = [];
-      if (incomingText) {
-        lines.push(`用户发送了 1 个文件，并附带文字：${incomingText}`);
-      } else {
-        lines.push('用户发送了 1 个文件，请先读取文件内容再回答。');
+    if (normalizedImageKeys.length > 0) {
+      const acceptedImageKeys = normalizedImageKeys.slice(0, MAX_IMAGE_INPUTS);
+      for (let index = 0; index < acceptedImageKeys.length; index += 1) {
+        const imageKey = acceptedImageKeys[index];
+        try {
+          const downloaded = await downloadImageToDownloads(client, {
+            accountName,
+            messageID,
+            imageKey,
+            fileName: `image-${index + 1}.jpg`,
+          });
+          imageAttachments.push(downloaded);
+          imagePaths.push(downloaded.filePath);
+          incomingAttachmentFacts.push(`已接收图片：${downloaded.fileName}，保存在 ${downloaded.relativePath}`);
+        } catch (err) {
+          console.error(`image_download=error key=${imageKey} message=${err.message}`);
+        }
       }
-      lines.push(`文件名：${file.fileName}`);
-      if (file.fileSize > 0) lines.push(`文件大小：${formatBytes(file.fileSize)}`);
-      lines.push(`本地临时路径：${file.filePath}`);
-      lines.push('如需使用文件内容，请直接读取该本地文件。');
+      if (imagePaths.length === 0 && fileAttachments.length === 0) {
+        await sendTextReplySafe(client, chatID, '图片接收失败，请稍后重试。', 'image_download_reply');
+        return;
+      }
+    }
+
+    if (fileAttachments.length > 0) {
+      const textParts = uniqueStrings([incomingText, fileInlineText].filter(Boolean));
+      if (textParts.length === 0 && carriedText) {
+        textParts.push(carriedText);
+        usedRecentTextCarry = true;
+      }
+      const lines = [];
+      if (textParts.length > 0) {
+        lines.push(`用户发送了 ${fileAttachments.length} 个文件，并附带文字：`);
+        lines.push(textParts.join('\n'));
+      } else {
+        lines.push(`用户发送了 ${fileAttachments.length} 个文件，请先读取文件内容再回答。`);
+      }
+      if (imagePaths.length > 0) {
+        lines.push(`同一条请求里还包含 ${imagePaths.length} 张图片，请结合图片内容一起处理。`);
+        for (const image of imageAttachments) {
+          lines.push(`图片保存路径：${image.filePath}`);
+          lines.push(`下载文件夹位置：${image.relativePath}`);
+        }
+      }
+      for (const file of fileAttachments) {
+        lines.push(`文件名：${file.fileName}`);
+        if (file.fileSize > 0) lines.push(`文件大小：${formatBytes(file.fileSize)}`);
+        lines.push(`本地下载路径：${file.filePath}`);
+        lines.push(`下载文件夹位置：${file.relativePath}`);
+      }
+      lines.push('如需使用文件内容，请直接读取这些本地文件。');
       userText = lines.join('\n');
-      historyUserText = incomingText
-        ? `[文件消息] ${file.fileName} + 文本：${incomingText}`
-        : `[文件消息] ${file.fileName}`;
+      const fileSummary = fileAttachments.map((item) => item.fileName).filter(Boolean).join('，') || `${fileAttachments.length} 个文件`;
+      const savedPaths = fileAttachments.map((item) => item.relativePath).filter(Boolean);
+      historyUserText = textParts.length > 0
+        ? `[文件消息] ${fileSummary} + 文本：${textParts.join(' / ')}`
+        : `[文件消息] ${fileSummary}`;
+      if (savedPaths.length > 0) {
+        historyUserText = `${historyUserText} + 下载位置：${savedPaths.join('，')}`;
+      }
+      if (imagePaths.length > 0) {
+        const imageSavedPaths = imageAttachments.map((item) => item.relativePath).filter(Boolean);
+        historyUserText = `${historyUserText} + 图片 ${imagePaths.length} 张`;
+        if (imageSavedPaths.length > 0) {
+          historyUserText = `${historyUserText} + 图片位置：${imageSavedPaths.join('，')}`;
+        }
+      }
     } else if (messageType === 'audio') {
       if (!parsedAudio.fileKey) {
         console.log('skip_reason=missing_audio_key');
@@ -4946,14 +6365,19 @@ async function main() {
 
       const durationText = formatDurationFromMs(parsedAudio.durationMs);
       const voiceLines = [];
+      const audioContextText = incomingText || carriedText;
+      if (!incomingText && carriedText) usedRecentTextCarry = true;
       if (durationText) voiceLines.push(`用户发送了 1 条语音消息，时长约 ${durationText}。`);
       else voiceLines.push('用户发送了 1 条语音消息。');
+      if (audioContextText) {
+        voiceLines.push(`用户还补充了文字：${audioContextText}`);
+      }
       voiceLines.push('下面是语音转写结果（可能存在少量识别误差）：');
       voiceLines.push(transcript.text);
       voiceLines.push('请基于语音内容直接回答用户。');
       userText = voiceLines.join('\n');
       historyUserText = compactText(
-        `[语音消息${durationText ? ` ${durationText}` : ''}] ${transcript.text}`,
+        `[语音消息${durationText ? ` ${durationText}` : ''}${audioContextText ? ' + 文本' : ''}] ${audioContextText ? `${audioContextText} | ` : ''}${transcript.text}`,
         4000
       );
     } else if (normalizedImageKeys.length === 0) {
@@ -4964,34 +6388,35 @@ async function main() {
       }
       historyUserText = userText;
     } else {
-      const acceptedImageKeys = normalizedImageKeys.slice(0, MAX_IMAGE_INPUTS);
-      const ignoredImages = Math.max(0, normalizedImageKeys.length - acceptedImageKeys.length);
-
-      for (const imageKey of acceptedImageKeys) {
-        try {
-          const downloaded = await downloadImageToTempFile(client, messageID, imageKey);
-          imagePaths.push(downloaded.filePath);
-          tempPathsToCleanup.push(downloaded.tempDir);
-        } catch (err) {
-          console.error(`image_download=error key=${imageKey} message=${err.message}`);
-        }
-      }
-
-      if (imagePaths.length === 0) {
-        await sendTextReplySafe(client, chatID, '图片接收失败，请稍后重试。', 'image_download_reply');
-        return;
-      }
-
-      if (incomingText) {
+      const effectiveImageText = incomingText || carriedText;
+      const ignoredImages = Math.max(0, normalizedImageKeys.length - Math.min(normalizedImageKeys.length, MAX_IMAGE_INPUTS));
+      if (!incomingText && carriedText) usedRecentTextCarry = true;
+      if (effectiveImageText) {
         userText = [
           `用户发送了 ${imagePaths.length} 张图片，并附带文字：`,
-          incomingText,
+          effectiveImageText,
           '请结合文字和图片内容回答。',
         ].join('\n');
-        historyUserText = `[图片消息 ${imagePaths.length} 张 + 文本] ${incomingText}`;
+        const imageLocationLines = imageAttachments.flatMap((item) => [
+          `图片保存路径：${item.filePath}`,
+          `下载文件夹位置：${item.relativePath}`,
+        ]);
+        if (imageLocationLines.length > 0) {
+          userText = [userText, ...imageLocationLines].join('\n');
+        }
+        const imageSavedPaths = imageAttachments.map((item) => item.relativePath).filter(Boolean).join('，');
+        historyUserText = `[图片消息 ${imagePaths.length} 张 + 文本] ${effectiveImageText}${imageSavedPaths ? ` + 保存：${imageSavedPaths}` : ''}`;
       } else {
-        userText = `用户发送了 ${imagePaths.length} 张图片，请直接分析图片内容并给出有帮助的回复。`;
-        historyUserText = `[图片消息] 用户发送了 ${imagePaths.length} 张图片`;
+        const imageLocationLines = imageAttachments.flatMap((item) => [
+          `图片保存路径：${item.filePath}`,
+          `下载文件夹位置：${item.relativePath}`,
+        ]);
+        userText = [
+          `用户发送了 ${imagePaths.length} 张图片，请直接分析图片内容并给出有帮助的回复。`,
+          ...imageLocationLines,
+        ].filter(Boolean).join('\n');
+        const imageSavedPaths = imageAttachments.map((item) => item.relativePath).filter(Boolean).join('，');
+        historyUserText = `[图片消息] 用户发送了 ${imagePaths.length} 张图片${imageSavedPaths ? ` + 保存：${imageSavedPaths}` : ''}`;
       }
       if (ignoredImages > 0) {
         userText = `${userText}\n注意：同一条消息中额外 ${ignoredImages} 张图片已忽略。`;
@@ -5000,6 +6425,30 @@ async function main() {
 
     const chatState = ensureChatState(chatStates, conversationScope.stateKey || chatID);
     if (messageType === 'text') {
+      const taskCommandResult = await scheduledJobManager.handleUserText(incomingText, {
+        accountName,
+        channelType: 'feishu',
+        scopeKey: conversationScope.stateKey || chatID,
+        chatID,
+        senderOpenId: senderOpenID,
+        messageID,
+        rootId: rootID,
+        parentId: parentID,
+        threadId: messageThreadID || rootID,
+        createdBy: senderOpenID,
+      });
+      if (taskCommandResult?.handled) {
+        if (taskCommandResult.reply) {
+          await sendTextReplySafe(client, chatID, taskCommandResult.reply, 'scheduled_task_reply');
+        }
+        console.log('reply=ok mode=scheduled_task');
+        return;
+      }
+      if (taskCommandResult?.passthroughText) {
+        userText = compactText(String(taskCommandResult.passthroughText || ''), 4000).trim() || userText;
+        historyUserText = userText;
+      }
+
       const threadCommand = parseThreadCommand(userText);
       if (threadCommand) {
         const result = handleThreadCommand(chatState, threadCommand);
@@ -5032,12 +6481,61 @@ async function main() {
       }
     }
 
+    if (usedRecentTextCarry) {
+      consumeRecentTextCarry(recentTextInputs, {
+        chatID,
+        chatType,
+        senderOpenID,
+        messageID: dispatchMeta.recentTextMessageID || '',
+      });
+    }
+
+    const senderSummary = buildSenderIdentitySummary(senderIdentity, { includeType: true });
+    if (senderSummary || quotedMessageContext.promptText) {
+      const promptContextBlocks = [];
+      if (senderSummary) promptContextBlocks.push(`当前发件人：${senderSummary}`);
+      if (quotedMessageContext.promptText) promptContextBlocks.push(quotedMessageContext.promptText);
+      promptContextBlocks.push(userText);
+      userText = promptContextBlocks.filter(Boolean).join('\n\n');
+    }
+    historyUserText = compactText(
+      [
+        senderSummary ? `[发件人] ${senderSummary}` : '',
+        historyUserText,
+        quotedMessageContext.historyText,
+      ].filter(Boolean).join('\n'),
+      4000
+    );
+
+    const releaseBusyTargets = markBusyTargetKeys(
+      busyTargetCounts,
+      buildBusyTargetKeysFromIncomingMessage({
+        channelType: 'feishu',
+        chatID,
+        chatType,
+        threadID: messageThreadID || rootID,
+        senderOpenID,
+      })
+    );
+    const parsedThingsCommand = messageType === 'text' ? parseThingsCommand(incomingText) : null;
+    if (parsedThingsCommand) {
+      console.log(
+        `things_command_guard=${parsedThingsCommand.type} reason=${parsedThingsCommand.reason || 'matched'} text=${compactText(incomingText, 160)}`
+      );
+    }
+
     const memoryBundleText = replyMode === 'codex' && memory.enabled
       ? buildBotMemoryBundleText(
         readBotMemoryStore(accountName, memory.roleMemory).store,
         historyUserText || userText
       )
       : '';
+    const thingsCommandHint = replyMode === 'codex' && messageType === 'text'
+      ? buildThingsCommandHint(parsedThingsCommand)
+      : '';
+    const guardedUserText = replyMode === 'codex' && messageType === 'text'
+      ? buildThingsCommandGuardedUserText(userText, parsedThingsCommand)
+      : userText;
 
     const progressReporter = replyMode === 'codex' && progress.enabled
       ? createProgressReporter({
@@ -5090,12 +6588,14 @@ async function main() {
         const codexReply = await generateCodexReply({
           codex,
           history,
-          userText,
+          userText: guardedUserText,
           imagePaths,
           sessionId: currentThread.codexThreadId,
           threadTitle: codexThreadTitle,
           forceExecution,
           memoryBundleText,
+          thingsCommandHint,
+          throwIfCancelled: () => taskControl.throwIfCancelled(),
           onSpawn: (child) => {
             taskControl.attachCodexChild(child);
           },
@@ -5118,6 +6618,110 @@ async function main() {
           const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle);
           console.log(`codex_thread_title_sync=${synced ? 'ok' : 'skip'} thread_id=${codexReply.threadId}`);
           console.log(`codex_thread_id=${codexReply.threadId} chat_id=${chatID} bot=${JSON.stringify(botName || accountName)} local_thread=${currentThread.id}`);
+        }
+      } else if (replyMode === 'local_model') {
+        const currentThread = getCurrentThread(chatState);
+        if (!currentThread) {
+          throw new Error('current thread not found');
+        }
+        const history = currentThread.history || [];
+        const forceExecution = shouldDelegateToCodexInLocalModel(historyUserText || userText);
+        console.log(`local_model_force_codex=${forceExecution ? 'true' : 'false'}`);
+        if (forceExecution) {
+          const codexThreadTitle = buildCodexThreadTitle({
+            botName: botName || accountName,
+            localThreadName: currentThread.name || currentThread.id,
+            userText: historyUserText || userText,
+          });
+          const codexReply = await generateCodexReply({
+            codex,
+            history,
+            userText: guardedUserText,
+            imagePaths,
+            sessionId: currentThread.codexThreadId,
+            threadTitle: codexThreadTitle,
+            forceExecution: true,
+            memoryBundleText,
+            thingsCommandHint,
+            throwIfCancelled: () => taskControl.throwIfCancelled(),
+            onSpawn: (child) => {
+              taskControl.attachCodexChild(child);
+            },
+            onProgressEvent: (event) => {
+              if (taskControl.isCancelled()) return;
+              if (!progressReporter) return;
+              if (typeof progressReporter.recordEvent === 'function') {
+                progressReporter.recordEvent(event);
+                return;
+              }
+              const stepText = formatCodexProgressEvent(event);
+              if (!stepText) return;
+              progressReporter.push(stepText);
+            },
+          });
+          taskControl.throwIfCancelled();
+          replyText = codexReply.reply;
+          if (codexReply.threadId) {
+            currentThread.codexThreadId = codexReply.threadId;
+            const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle);
+            console.log(`codex_thread_title_sync=${synced ? 'ok' : 'skip'} thread_id=${codexReply.threadId}`);
+            console.log(`codex_thread_id=${codexReply.threadId} chat_id=${chatID} bot=${JSON.stringify(botName || accountName)} local_thread=${currentThread.id}`);
+          }
+        } else {
+          const localModelReply = await generateLocalModelReply({
+            localModel,
+            history,
+            userText: guardedUserText,
+            imagePaths,
+            memoryBundleText,
+          });
+          taskControl.throwIfCancelled();
+          const delegateDecision = extractCodexDelegateDirective(localModelReply.reply);
+          if (delegateDecision.hasDirective) {
+            const delegatedPrompt = delegateDecision.delegatedPrompt || guardedUserText;
+            console.log(`local_model_delegate_to_codex=true delegated_prompt_chars=${delegatedPrompt.length}`);
+            const codexThreadTitle = buildCodexThreadTitle({
+              botName: botName || accountName,
+              localThreadName: currentThread.name || currentThread.id,
+              userText: historyUserText || userText,
+            });
+            const codexReply = await generateCodexReply({
+              codex,
+              history,
+              userText: delegatedPrompt,
+              imagePaths,
+              sessionId: currentThread.codexThreadId,
+              threadTitle: codexThreadTitle,
+              forceExecution: true,
+              memoryBundleText,
+              thingsCommandHint,
+              throwIfCancelled: () => taskControl.throwIfCancelled(),
+              onSpawn: (child) => {
+                taskControl.attachCodexChild(child);
+              },
+              onProgressEvent: (event) => {
+                if (taskControl.isCancelled()) return;
+                if (!progressReporter) return;
+                if (typeof progressReporter.recordEvent === 'function') {
+                  progressReporter.recordEvent(event);
+                  return;
+                }
+                const stepText = formatCodexProgressEvent(event);
+                if (!stepText) return;
+                progressReporter.push(stepText);
+              },
+            });
+            taskControl.throwIfCancelled();
+            replyText = codexReply.reply;
+            if (codexReply.threadId) {
+              currentThread.codexThreadId = codexReply.threadId;
+              const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle);
+              console.log(`codex_thread_title_sync=${synced ? 'ok' : 'skip'} thread_id=${codexReply.threadId}`);
+              console.log(`codex_thread_id=${codexReply.threadId} chat_id=${chatID} bot=${JSON.stringify(botName || accountName)} local_thread=${currentThread.id}`);
+            }
+          } else {
+            replyText = localModelReply.reply;
+          }
         }
       } else {
         replyText = normalizeReplyText(replyPrefix, userText);
@@ -5144,7 +6748,10 @@ async function main() {
           codex.cwd || process.cwd(),
           () => !taskControl.isCancelled()
         );
-        memoryLiveToolFacts = deriveMemoryLiveToolFacts(attachmentSendResult);
+        memoryLiveToolFacts = [
+          ...incomingAttachmentFacts,
+          ...deriveMemoryLiveToolFacts(attachmentSendResult),
+        ];
         taskControl.throwIfCancelled();
         if (!userReplyText && attachmentSendResult.sent.length > 0) {
           userReplyText = buildDefaultAttachmentReply(attachmentSendResult.sent);
@@ -5168,7 +6775,7 @@ async function main() {
       } else {
         const echoReply = compactText(codexRawReply, FEISHU_TEXT_CHUNK_LIMIT).trim();
         if (!echoReply) {
-          throw new Error('echo reply empty');
+          throw new Error(`${replyMode} reply empty`);
         }
         if (fakeStream.enabled && !shouldRenderFeishuMarkdown(echoReply)) {
           await sendTextReplyWithFakeStream(client, chatID, echoReply, fakeStream);
@@ -5185,7 +6792,7 @@ async function main() {
           return recordConversationIntoBotMemoryStore(store, {
             userText: historyUserText || userText,
             assistantText: replyText || codexRawReply,
-            liveToolFacts: memoryLiveToolFacts,
+            liveToolFacts: memoryLiveToolFacts.length > 0 ? memoryLiveToolFacts : incomingAttachmentFacts,
             threadId: activeMemoryThread?.id || '',
           });
         });
@@ -5193,7 +6800,7 @@ async function main() {
           `memory_bundle=updated account=${accountName} profile=${storedMemory.profileFacts.length} role=${storedMemory.roleMemoryItems.length} history=${storedMemory.historyItems.length}`
         );
       }
-      if (replyMode === 'codex' && codex.historyTurns > 0) {
+      if ((replyMode === 'codex' && codex.historyTurns > 0) || (replyMode === 'local_model' && localModel.historyTurns > 0)) {
         const currentThread = getCurrentThread(chatState);
         if (!currentThread) {
           throw new Error('current thread not found after reply');
@@ -5205,7 +6812,7 @@ async function main() {
           { role: 'user', text: historyUserText },
           { role: 'assistant', text: replyForHistory },
         ];
-        const maxItems = codex.historyTurns * 2;
+        const maxItems = (replyMode === 'local_model' ? localModel.historyTurns : codex.historyTurns) * 2;
         while (nextHistory.length > maxItems) nextHistory.shift();
         currentThread.history = nextHistory;
         currentThread.updatedAt = Date.now();
@@ -5228,6 +6835,7 @@ async function main() {
         await progressReporter.fail(`处理失败：${err.message}`);
       }
     } finally {
+      releaseBusyTargets();
       if (typingState) {
         await removeTypingIndicatorSafe(client, typingState);
       }
@@ -5247,10 +6855,23 @@ async function main() {
     loggerLevel: lark.LoggerLevel.info,
   }).register({
     'im.message.receive_v1': (data) => {
+      const rawMessage = data?.message || {};
+      const rawChatID = String(rawMessage.chat_id || '').trim();
+      const rawChatType = String(rawMessage.chat_type || '').trim().toLowerCase();
+      const rawMessageID = String(rawMessage.message_id || '').trim();
+      const rawSenderOpenID = String(data?.sender?.sender_id?.open_id || '').trim();
+      const rawMessageType = String(rawMessage.message_type || '').trim().toLowerCase();
+      const rawScope = buildConversationScope(rawChatID, rawChatType, rawSenderOpenID, rawMessageID);
+      const rawText = rawMessageType === 'text' ? normalizeIncomingText(parseMessageText(rawMessage.content || ''), rawMessage.mentions || [], mentionAliases) : '';
+      const shouldQueueScheduledTaskMessage = rawMessageType === 'text'
+        && scheduledJobManager.shouldQueueMessage(rawText, {
+          scopeKey: rawScope.stateKey || rawChatID,
+          chatID: rawChatID,
+        });
       const dispatchEnvelope = buildDispatchEnvelope(data, {
         mentionAliases,
         botOpenId: creds.botOpenId.value,
-        recentMentionedSenders,
+        recentTextInputs,
       });
       dispatchLatestByChat(
         chatRunners,
@@ -5258,7 +6879,7 @@ async function main() {
         dispatchEnvelope.payload,
         handleMessageEvent,
         {
-          shouldSupersede: () => dispatchEnvelope.shouldSupersedeActiveTask,
+          shouldSupersede: () => shouldQueueScheduledTaskMessage ? false : dispatchEnvelope.shouldSupersedeActiveTask,
         }
       );
     },
@@ -5275,6 +6896,7 @@ async function main() {
     if (stopping) return;
     stopping = true;
     console.log(`FEISHU_WS_STOP signal=${signal}`);
+    scheduledJobManager.stop();
     wsClient.close({ force: true });
     setTimeout(() => process.exit(0), 50);
   }
@@ -5297,6 +6919,10 @@ async function main() {
   console.log(`reply_mode=${replyMode}`);
   console.log(`typing_indicator=${typing.enabled ? 'true' : 'false'}`);
   console.log(`fake_stream=${fakeStream.enabled ? 'true' : 'false'}`);
+  console.log(`local_model_cwd=${localModel.cwd || '(missing)'}`);
+  console.log(`local_model_server_base_url=${localModel.serverBaseUrl || '(none)'}`);
+  console.log(`local_model_prompt_script=${localModel.promptScript || '(missing)'}`);
+  console.log(`local_model_history_turns=${localModel.historyTurns}`);
   console.log(`progress_notice=${progress.enabled ? 'true' : 'false'}`);
   console.log(`progress_mode=${progress.mode}`);
   if (progress.mode === 'doc') {

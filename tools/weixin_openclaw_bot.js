@@ -47,6 +47,13 @@ const DEFAULT_CODEX_SYSTEM_PROMPT = [
   '不要承诺“稍后回复”或“几分钟后回复”；必须在当前这一条里给出可执行结果，或明确失败原因。',
   '默认使用简体中文，除非用户明确要求其他语言。',
 ].join('\n');
+const DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT = [
+  '你是“微信本地模型助手”，通过微信和用户交流。',
+  '请直接回答用户问题，不要复述用户原话。',
+  '如果信息不足，先给最可执行的下一步，再明确缺少什么。',
+  '不要承诺“稍后回复”或“几分钟后回复”；必须在当前这一条里给出可执行结果，或明确失败原因。',
+  '默认使用简体中文，除非用户明确要求其他语言。',
+].join('\n');
 const SESSION_EXPIRED_ERRCODE = -14;
 const WEIXIN_SEND_FILE_DIRECTIVE_PREFIX = '[[WEIXIN_SEND_FILE:';
 const WEIXIN_SEND_IMAGE_DIRECTIVE_PREFIX = '[[WEIXIN_SEND_IMAGE:';
@@ -69,6 +76,13 @@ function asBool(value, fallback) {
 function asInt(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
   if (value === undefined || value === null || value === '') return fallback;
   const n = Number.parseInt(String(value), 10);
+  if (Number.isNaN(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function asFloat(value, fallback, min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const n = Number.parseFloat(String(value));
   if (Number.isNaN(n)) return fallback;
   return Math.min(max, Math.max(min, n));
 }
@@ -98,6 +112,153 @@ function resolveOptionalDirList(value) {
     output.push(resolved);
   }
   return output;
+}
+
+function normalizeReplyMode(raw) {
+  const value = normalizeString(raw).toLowerCase();
+  if (value === 'local_model') return 'local_model';
+  return 'codex';
+}
+
+function resolveLocalModelConfig(config) {
+  const localModelRaw = { ...(config.local_model || config.localModel || {}) };
+  return {
+    serverBaseUrl: normalizeString(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_SERVER_BASE_URL
+      || localModelRaw.server_base_url
+      || localModelRaw.serverBaseUrl
+    ),
+    model: normalizeString(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_MODEL
+      || localModelRaw.model
+    ),
+    temp: asFloat(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_TEMP || localModelRaw.temp,
+      0.2,
+      0,
+      2
+    ),
+    maxTokens: asInt(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_MAX_TOKENS || localModelRaw.max_tokens || localModelRaw.maxTokens,
+      256,
+      16,
+      4096
+    ),
+    requestTimeoutMs: asInt(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_REQUEST_TIMEOUT_MS
+      || localModelRaw.request_timeout_ms
+      || localModelRaw.requestTimeoutMs,
+      180000,
+      10000,
+      600000
+    ),
+    historyTurns: asInt(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_HISTORY_TURNS
+      || localModelRaw.history_turns
+      || localModelRaw.historyTurns,
+      6,
+      0,
+      20
+    ),
+    systemPrompt: normalizeString(
+      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_SYSTEM_PROMPT
+      || localModelRaw.system_prompt
+      || localModelRaw.systemPrompt
+    ) || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT,
+  };
+}
+
+async function requestLocalModelServer({ localModel, messages }) {
+  const baseUrl = String(localModel?.serverBaseUrl || '').trim().replace(/\/+$/, '');
+  if (!baseUrl) {
+    throw new Error('local model server_base_url missing');
+  }
+  if (typeof fetch !== 'function') {
+    throw new Error('global fetch is not available in this node runtime');
+  }
+  const controller = new AbortController();
+  const timeoutMs = Number(localModel?.requestTimeoutMs || 180000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const body = {
+      messages,
+      temperature: Number(localModel?.temp ?? 0.2),
+      max_tokens: Number(localModel?.maxTokens || 256),
+      stream: false,
+      chat_template_kwargs: {
+        enable_thinking: false,
+      },
+    };
+    if (String(localModel?.model || '').trim()) {
+      body.model = String(localModel.model || '').trim();
+    }
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const raw = await response.text();
+    let data = null;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      data = null;
+    }
+    if (!response.ok) {
+      throw new Error(`status=${response.status} body=${compactText(raw || '', 800)}`);
+    }
+    const choice = Array.isArray(data?.choices) ? data.choices[0] : null;
+    const message = choice?.message || {};
+    const content = message?.content;
+    if (typeof content === 'string' && content.trim()) {
+      return content.trim();
+    }
+    if (Array.isArray(content)) {
+      const text = content
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item.text === 'string') return item.text;
+          if (item && typeof item.content === 'string') return item.content;
+          return '';
+        })
+        .join('')
+        .trim();
+      if (text) return text;
+    }
+    throw new Error('local model server returned empty content');
+  } catch (err) {
+    if (String(err?.name || '') === 'AbortError') {
+      throw new Error(`local model server timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function generateLocalModelReply({ localModel, history = [], userText = '' }) {
+  const messages = [];
+  if (localModel.systemPrompt) {
+    messages.push({ role: 'system', content: localModel.systemPrompt });
+  }
+  for (const item of history || []) {
+    const role = String(item?.role || '').trim().toLowerCase() === 'assistant' ? 'assistant' : 'user';
+    const text = compactText(String(item?.text || '').trim(), 2400);
+    if (!text) continue;
+    messages.push({ role, content: text });
+  }
+  messages.push({
+    role: 'user',
+    content: compactText(String(userText || '').trim(), 2400) || '(空)',
+  });
+  const reply = await requestLocalModelServer({ localModel, messages });
+  return {
+    reply: String(reply || ''),
+  };
 }
 
 function loadWeixinConfig(accountName, configDir) {
@@ -147,6 +308,9 @@ function resolveWeixinRuntimeConfig(config) {
   }
 
   return {
+    replyMode: normalizeReplyMode(
+      process.env.WEIXIN_OPENCLAW_REPLY_MODE || config.reply_mode || config.replyMode
+    ),
     botName: normalizeString(config.bot_name) || '微信 Codex 助手',
     baseUrl: normalizeString(process.env.WEIXIN_OPENCLAW_BASE_URL || config.base_url) || DEFAULT_BASE_URL,
     token: normalizeString(process.env.WEIXIN_OPENCLAW_TOKEN || config.token),
@@ -184,6 +348,7 @@ function resolveWeixinRuntimeConfig(config) {
       30 * 60_000
     ),
     codex: resolveCodexConfig({ codex: codexRaw }),
+    localModel: resolveLocalModelConfig(config),
   };
 }
 
@@ -450,14 +615,28 @@ async function handleInboundMessage({
 
   const typingState = await startTypingIfPossible(config, userId, contextToken, ticketCache);
   try {
-    const codexReply = await generateCodexReply({
-      codex: config.codex,
-      history: peerState.history,
-      userText,
-      sessionId: peerState.codexThreadId,
-      threadTitle: buildThreadTitle(userId),
-    });
-    const replyPlan = extractWeixinAttachmentDirectives(codexReply.reply, config.codex.cwd || process.cwd());
+    const replyMode = config.replyMode === 'local_model' ? 'local_model' : 'codex';
+    const activeHistoryTurns = replyMode === 'local_model'
+      ? config.localModel.historyTurns
+      : config.codex.historyTurns;
+    const cappedHistory = peerState.history.slice(-Math.max(0, activeHistoryTurns) * 2);
+    const replyResult = replyMode === 'local_model'
+      ? await generateLocalModelReply({
+        localModel: config.localModel,
+        history: cappedHistory,
+        userText,
+      })
+      : await generateCodexReply({
+        codex: config.codex,
+        history: cappedHistory,
+        userText,
+        sessionId: peerState.codexThreadId,
+        threadTitle: buildThreadTitle(userId),
+      });
+    const replyPlan = extractWeixinAttachmentDirectives(
+      replyResult.reply,
+      config.codex.cwd || process.cwd()
+    );
     let replyText = normalizeString(replyPlan.text);
     if (!replyText && replyPlan.attachments.length === 0) {
       replyText = '我收到这条消息了，但这次没有生成可以发送的正文。';
@@ -476,12 +655,12 @@ async function handleInboundMessage({
     if (attachmentFailureReply) {
       await sendReplyChunks(config, userId, contextToken, attachmentFailureReply);
     }
-    peerState.codexThreadId = normalizeString(codexReply.threadId) || peerState.codexThreadId;
+    peerState.codexThreadId = normalizeString(replyResult.threadId) || peerState.codexThreadId;
     const historyReplyText = [replyText]
       .filter(Boolean)
       .join('\n')
       .trim();
-    upsertHistory(peerState, userText, historyReplyText, config.codex.historyTurns);
+    upsertHistory(peerState, userText, historyReplyText, activeHistoryTurns);
     return true;
   } catch (err) {
     const messageText = `处理失败：${compactText(err?.message || String(err), 240)}`;

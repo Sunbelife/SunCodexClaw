@@ -47,5 +47,17 @@
   "memory": {
     "enabled": true,
     "role_memory": ""
+  },
+  "outbound_channels": {
+    "wecom": {
+      "corp_id": "",
+      "agent_id": "",
+      "secret": "",
+      "base_url": "https://qyapi.weixin.qq.com"
+    },
+    "named_targets": {
+      "feishu": {},
+      "wecom": {}
+    }
   }
 }

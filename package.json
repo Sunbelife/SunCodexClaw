@@ -8,6 +8,7 @@
     "feishu:ws": "node tools/feishu_ws_bot.js --account default",
     "feishu:ws:dry": "node tools/feishu_ws_bot.js --account default --dry-run",
     "feishu:ctl": "bash tools/feishu_bot_ctl.sh",
+    "feishu:daily-report": "node tools/feishu_daily_report.js --account fei-ls",
     "feishu:start": "bash tools/feishu_bot_ctl.sh start all",
     "feishu:stop": "bash tools/feishu_bot_ctl.sh stop all",
     "feishu:restart": "bash tools/feishu_bot_ctl.sh restart all",

@@ -15,3 +15,7 @@ config/weixin_openclaw/*.json
 !config/weixin_openclaw/*.example.json
 config/secrets/*.yaml
 !config/secrets/*.example.yaml
+
+# SwiftPM build artifacts
+apps/*/.build/
+apps/*/.swiftpm/

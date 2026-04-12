@@ -513,6 +513,7 @@ module.exports = {
   resolveCodexConfig,
   resolveCredentials,
   resolveDomain,
+  runCodexExec,
   sendCodexReplyPassthrough,
   splitTextForFeishu,
 };
