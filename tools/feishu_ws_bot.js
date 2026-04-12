@@ -75,7 +75,6 @@ const FEISHU_DOCX_HEADING3_BLOCK_TYPE = 5;
 const FEISHU_DOCX_CODE_BLOCK_TYPE = 14;
 const VALID_CODEX_SANDBOXES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const VALID_CODEX_APPROVAL_POLICIES = new Set(['untrusted', 'on-failure', 'on-request', 'never']);
-const VALID_PROGRESS_MODES = new Set(['doc']);
 const VALID_PROGRESS_DOC_LINK_SCOPES = new Set(['same_tenant', 'anyone', 'closed']);
 const IMAGE_FILE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.tif', '.tiff', '.bmp', '.ico']);
 const TRANSCRIPTION_MIME_BY_EXTENSION = new Map([
@@ -307,11 +306,6 @@ function resolveProgressConfig(config) {
       || '已接收，正在执行。'
   ).trim();
 
-  const rawMode = String(
-    getArg('--progress-mode', process.env.FEISHU_PROGRESS_MODE || progress.mode || 'doc')
-  ).trim().toLowerCase();
-  const mode = VALID_PROGRESS_MODES.has(rawMode) ? rawMode : 'doc';
-
   const doc = progress.doc || {};
   const titlePrefix = String(
     getArg(
@@ -352,7 +346,7 @@ function resolveProgressConfig(config) {
   return {
     enabled,
     message: message || '已接收，正在执行。',
-    mode,
+    mode: 'doc',
     doc: {
       titlePrefix,
       shareToChat,
@@ -4885,182 +4879,6 @@ async function recallMessageSafe(client, messageID, logTag = 'message_recall') {
     console.error(`${logTag}=error message_id=${target} message=${err.message}`);
     return false;
   }
-}
-
-function createMessageProgressReporter({ client, chatID, initialMessage, minUpdateIntervalMs = 700 }) {
-  const intro = compactText(String(initialMessage || '').trim() || '已接收，开始执行。', 1200);
-  const minInterval = Math.max(300, Number(minUpdateIntervalMs) || 1000);
-  const steps = [];
-  const startedAt = Date.now();
-
-  let messageID = '';
-  let lastRendered = '';
-  let closed = false;
-  let lastUpdateAt = 0;
-  let flushTimer = null;
-  let queue = Promise.resolve();
-
-  function runSerial(task) {
-    const next = queue
-      .catch(() => {})
-      .then(task);
-    queue = next.catch(() => {});
-    return next;
-  }
-
-  function render(extraLine = '') {
-    const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-    const lines = [intro, '', `运行中：${elapsedSec}s`];
-    if (steps.length > 0) {
-      lines.push(`当前步骤：${steps[steps.length - 1]}`);
-      lines.push('');
-      lines.push('步骤记录：');
-      for (let i = 0; i < steps.length; i += 1) {
-        lines.push(`${i + 1}. ${steps[i]}`);
-      }
-    }
-    if (extraLine) {
-      lines.push('');
-      lines.push(extraLine);
-    }
-    return compactText(lines.join('\n'), 4000).trim();
-  }
-
-  async function createNewProgressMessage(text, reason = '') {
-    try {
-      const created = await sendTextReply(client, chatID, text);
-      const newID = String(created?.data?.message_id || '').trim();
-      if (!newID) return false;
-      messageID = newID;
-      lastRendered = text;
-      lastUpdateAt = Date.now();
-      if (reason) console.log(`progress_rollover=ok reason=${reason}`);
-      return true;
-    } catch (err) {
-      console.error(`progress_rollover=error reason=${reason} message=${err.message}`);
-      return false;
-    }
-  }
-
-  async function ensureMessage() {
-    if (messageID) return true;
-    return createNewProgressMessage(intro, 'init');
-  }
-
-  async function applyText(nextText, logTag = 'progress_apply') {
-    const target = compactText(String(nextText || '').trim(), 4000);
-    if (!target) return false;
-    if (target === lastRendered) return true;
-
-    const ok = await ensureMessage();
-    if (!ok || !messageID) return false;
-
-    try {
-      await updateTextMessage(client, messageID, target);
-      lastRendered = target;
-      lastUpdateAt = Date.now();
-      return true;
-    } catch (err) {
-      if (isMessageEditLimitError(err)) {
-        return createNewProgressMessage(target, 'platform_edit_limit');
-      }
-      console.error(`${logTag}=error message=${err.message}`);
-      return false;
-    }
-  }
-
-  function clearTimers() {
-    if (flushTimer) {
-      clearTimeout(flushTimer);
-      flushTimer = null;
-    }
-  }
-
-  function scheduleFlush() {
-    if (closed) return;
-    if (flushTimer) return;
-    const elapsed = Date.now() - lastUpdateAt;
-    const waitMs = Math.max(0, minInterval - elapsed);
-    flushTimer = setTimeout(() => {
-      flushTimer = null;
-      if (closed) return;
-      runSerial(async () => {
-        await applyText(render(), 'progress_flush');
-      });
-    }, waitMs);
-  }
-
-  function pushStep(stepText) {
-    if (closed) return;
-    const normalized = normalizeProgressSnippet(stepText, 120);
-    if (!normalized) return;
-    if (steps[steps.length - 1] === normalized) return;
-    steps.push(normalized);
-    while (steps.length > 10) steps.shift();
-    if (Date.now() - lastUpdateAt >= minInterval) {
-      runSerial(async () => {
-        await applyText(render(), 'progress_push');
-      });
-      return;
-    }
-    scheduleFlush();
-  }
-
-  return {
-    async start() {
-      await runSerial(async () => {
-        await ensureMessage();
-      });
-    },
-    push(stepText) {
-      pushStep(stepText);
-    },
-    recordEvent(event) {
-      const stepText = formatCodexProgressEvent(event);
-      if (!stepText) return;
-      pushStep(stepText);
-    },
-    async finalizeReply(finalReplyText) {
-      if (closed) return false;
-      closed = true;
-      clearTimers();
-      await queue.catch(() => {});
-
-      const finalText = compactText(String(finalReplyText || '').trim(), 4000);
-      if (!finalText) return false;
-      return runSerial(async () => applyText(finalText, 'progress_finalize'));
-    },
-    async complete(note = '执行完成，回复见下条消息。') {
-      if (closed) return false;
-      closed = true;
-      clearTimers();
-      await queue.catch(() => {});
-
-      const doneNote = normalizeProgressSnippet(note, 160) || '执行完成。';
-      return runSerial(async () => applyText(render(doneNote), 'progress_complete'));
-    },
-    async fail(note = '处理失败。') {
-      if (closed) return false;
-      closed = true;
-      clearTimers();
-      await queue.catch(() => {});
-
-      const failText = render(normalizeProgressSnippet(note, 160) || '处理失败。');
-      return runSerial(async () => applyText(failText, 'progress_fail'));
-    },
-    async recordFinalReply() {
-      return false;
-    },
-    async abort() {
-      closed = true;
-      clearTimers();
-      await queue.catch(() => {});
-      if (!messageID) return true;
-      const target = messageID;
-      messageID = '';
-      return recallMessageSafe(client, target, 'progress_message_recall');
-    },
-  };
 }
 
 function createSilentProgressReporter() {
