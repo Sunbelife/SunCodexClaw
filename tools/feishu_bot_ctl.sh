@@ -202,6 +202,7 @@ start_one_launchctl() {
     "${BOT_SCRIPT}" \
     "${account}" \
     "${logf}"
+  cmd="export NODE_TLS_REJECT_UNAUTHORIZED=0; ${cmd}"
   launchctl submit -l "${label}" -- /bin/zsh -lc "${cmd}"
   sleep 1
 

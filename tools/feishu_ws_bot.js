@@ -75,7 +75,7 @@ const FEISHU_DOCX_HEADING3_BLOCK_TYPE = 5;
 const FEISHU_DOCX_CODE_BLOCK_TYPE = 14;
 const VALID_CODEX_SANDBOXES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const VALID_CODEX_APPROVAL_POLICIES = new Set(['untrusted', 'on-failure', 'on-request', 'never']);
-const VALID_PROGRESS_MODES = new Set(['message', 'doc']);
+const VALID_PROGRESS_MODES = new Set(['doc']);
 const VALID_PROGRESS_DOC_LINK_SCOPES = new Set(['same_tenant', 'anyone', 'closed']);
 const IMAGE_FILE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.tif', '.tiff', '.bmp', '.ico']);
 const TRANSCRIPTION_MIME_BY_EXTENSION = new Map([
@@ -308,9 +308,9 @@ function resolveProgressConfig(config) {
   ).trim();
 
   const rawMode = String(
-    getArg('--progress-mode', process.env.FEISHU_PROGRESS_MODE || progress.mode || 'message')
+    getArg('--progress-mode', process.env.FEISHU_PROGRESS_MODE || progress.mode || 'doc')
   ).trim().toLowerCase();
-  const mode = VALID_PROGRESS_MODES.has(rawMode) ? rawMode : 'message';
+  const mode = VALID_PROGRESS_MODES.has(rawMode) ? rawMode : 'doc';
 
   const doc = progress.doc || {};
   const titlePrefix = String(
@@ -5568,24 +5568,15 @@ function createProgressReporter({
   progressConfig = {},
   minUpdateIntervalMs = 700,
 }) {
-  const messageFactory = () => createMessageProgressReporter({
+  return createDocProgressReporter({
     client,
     chatID,
     initialMessage,
-    minUpdateIntervalMs,
+    userText,
+    progressConfig,
+    minUpdateIntervalMs: Math.max(2000, minUpdateIntervalMs),
+    fallbackFactory: () => createSilentProgressReporter(),
   });
-  if (progressConfig?.mode === 'doc') {
-    return createDocProgressReporter({
-      client,
-      chatID,
-      initialMessage,
-      userText,
-      progressConfig,
-      minUpdateIntervalMs: Math.max(2000, minUpdateIntervalMs),
-      fallbackFactory: () => createSilentProgressReporter(),
-    });
-  }
-  return messageFactory();
 }
 
 async function downloadImageToDownloads(client, {

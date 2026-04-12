@@ -15,7 +15,7 @@
   "progress": {
     "enabled": true,
     "message": "已接收，正在执行。",
-    "mode": "message",
+    "mode": "doc",
     "doc": {
       "title_prefix": "Codex 任务进度",
       "share_to_chat": true,
