@@ -32,6 +32,8 @@ const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_SCHEDULE = '08:00';
 const STORE_DIR = 'scheduled_jobs';
 const LEGACY_STORE_DIR = 'scheduled_report_tasks';
+const RUN_LOCK_DIR = 'scheduled_job_run_locks';
+const RUN_LOCK_STALE_MS = 30 * 60 * 1000;
 const RETRY_DELAYS_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
 const SUPPORTED_TASK_TYPES = new Set([TASK_TYPE_DAILY_STORE_REPORT, TASK_TYPE_SKILL_RUN]);
 const DEFAULT_BUSY_POLICY = 'queue_after_current';
@@ -152,6 +154,87 @@ function taskStorePath(runtimeDir, accountName) {
 
 function legacyTaskStorePath(runtimeDir, accountName) {
   return path.join(runtimeDir, LEGACY_STORE_DIR, `${accountName}.json`);
+}
+
+function safePathSegment(value) {
+  const text = normalizeString(value).replace(/[^A-Za-z0-9._-]+/g, '_');
+  return text || 'unknown';
+}
+
+function taskRunLockPath(runtimeDir, accountName, taskId, runKey) {
+  return path.join(
+    runtimeDir,
+    RUN_LOCK_DIR,
+    `${safePathSegment(accountName)}__${safePathSegment(taskId)}__${safePathSegment(runKey)}.json`
+  );
+}
+
+function readRunLock(filePath) {
+  try {
+    return asPlainObject(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+  } catch (_) {
+    return {};
+  }
+}
+
+function acquireAutoRunLock(runtimeDir, accountName, taskId, runKey) {
+  const filePath = taskRunLockPath(runtimeDir, accountName, taskId, runKey);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const payload = {
+    status: 'running',
+    account_name: accountName,
+    task_id: taskId,
+    run_key: runKey,
+    pid: process.pid,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+
+  try {
+    fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    return { acquired: true, filePath };
+  } catch (err) {
+    if (err?.code !== 'EEXIST') throw err;
+    const current = readRunLock(filePath);
+    if (normalizeString(current.status) === 'sent') {
+      return { acquired: false, filePath, reason: 'sent' };
+    }
+    const createdAt = Date.parse(normalizeString(current.created_at || current.updated_at));
+    const stale = !Number.isFinite(createdAt) || Date.now() - createdAt > RUN_LOCK_STALE_MS;
+    if (!stale) {
+      return { acquired: false, filePath, reason: normalizeString(current.status) || 'locked' };
+    }
+    try {
+      fs.unlinkSync(filePath);
+    } catch (_) {
+      return { acquired: false, filePath, reason: 'locked' };
+    }
+    return acquireAutoRunLock(runtimeDir, accountName, taskId, runKey);
+  }
+}
+
+function markAutoRunLockSent(lock, receiptId = '') {
+  if (!lock?.acquired || !lock.filePath) return;
+  const current = readRunLock(lock.filePath);
+  const next = {
+    ...current,
+    status: 'sent',
+    receipt_id: normalizeString(receiptId),
+    updated_at: nowIso(),
+  };
+  fs.writeFileSync(lock.filePath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+}
+
+function releaseAutoRunLock(lock) {
+  if (!lock?.acquired || !lock.filePath) return;
+  try {
+    fs.unlinkSync(lock.filePath);
+  } catch (_) {
+    // best effort
+  }
 }
 
 function readTaskStore(filePath, fallbackFilePath = '') {
@@ -1360,14 +1443,37 @@ function createScheduledJobManager({
     const now = new Date();
     const today = buildYmd(now, task.timezone);
     const reportDate = normalizeString(options.reportDate) || addDaysYmd(today, -1);
+    if (!manual && normalizeString(task.last_auto_run_key) === today) {
+      log(`scheduled_job=skip_duplicate account=${accountName} task_id=${taskId} run_key=${today} reason=already_sent`);
+      return {
+        ok: true,
+        status: 'already_sent',
+        task,
+      };
+    }
+    const autoRunLock = manual ? null : acquireAutoRunLock(runtimeDir, accountName, taskId, today);
+    if (!manual && !autoRunLock.acquired) {
+      log(`scheduled_job=skip_duplicate account=${accountName} task_id=${taskId} run_key=${today} reason=${autoRunLock.reason || 'locked'}`);
+      return {
+        ok: true,
+        status: 'already_sent',
+        task,
+      };
+    }
     runningTasks.add(taskId);
     log(`scheduled_job=run account=${accountName} task_id=${taskId} task_type=${task.task_type} manual=${manual ? 'true' : 'false'} report_date=${reportDate}`);
+    let deliveredSuccessfully = false;
 
     try {
       const delivered = await deliverTaskLike(task, {
         ...options,
         reportDate,
       });
+      deliveredSuccessfully = true;
+      const receiptId = Array.isArray(delivered?.receipt?.messageIds) ? normalizeString(delivered.receipt.messageIds[0]) : '';
+      if (!manual) {
+        markAutoRunLockSent(autoRunLock, receiptId);
+      }
       const nextTask = {
         ...task,
         updated_at: nowIso(),
@@ -1375,7 +1481,7 @@ function createScheduledJobManager({
         last_status: manual ? 'manual_sent' : 'sent',
         last_error: '',
         last_error_at: '',
-        last_receipt_id: Array.isArray(delivered?.receipt?.messageIds) ? normalizeString(delivered.receipt.messageIds[0]) : '',
+        last_receipt_id: receiptId,
         retry_after_at: 0,
         retry_count: 0,
         next_run_at: computeNextRunAt(task, now),
@@ -1394,6 +1500,9 @@ function createScheduledJobManager({
         task: updated,
       };
     } catch (err) {
+      if (!manual && !deliveredSuccessfully) {
+        releaseAutoRunLock(autoRunLock);
+      }
       const retryCount = manual ? 0 : Number(task.retry_count || 0) + 1;
       const retryDelay = RETRY_DELAYS_MS[Math.min(retryCount - 1, RETRY_DELAYS_MS.length - 1)] || 0;
       const exhausted = !manual && retryCount >= RETRY_DELAYS_MS.length;
@@ -1488,6 +1597,9 @@ function createScheduledJobManager({
     if (timer) return;
     maybeUpgradeManagedDailyReportTasks();
     realignTasksOnStart();
+    if (legacyTask && store.tasks.some((task) => isLegacyDailyReportTask(task))) {
+      persistStore();
+    }
     void tick().catch((err) => {
       log(`scheduled_job=tick_error account=${accountName} message=${compactText(err.message, 200)}`);
     });

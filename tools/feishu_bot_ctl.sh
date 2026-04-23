@@ -133,6 +133,17 @@ launchctl_label() {
   printf '%s.%s\n' "${LAUNCHCTL_PREFIX}" "$1"
 }
 
+launchctl_plist_path() {
+  printf '%s/%s.plist\n' "${HOME}/Library/LaunchAgents" "$(launchctl_label "$1")"
+}
+
+launchctl_plist_exists() {
+  local account="$1"
+  local plist_path
+  plist_path="$(launchctl_plist_path "${account}")"
+  [[ -f "${plist_path}" ]]
+}
+
 launchctl_job_exists() {
   local account="$1"
   local label
@@ -166,54 +177,98 @@ is_launchctl_bot_running() {
   is_bot_pid_for_account "${pid}" "${account}"
 }
 
+wait_for_launchctl_absent() {
+  local account="$1"
+  local attempt
+  for attempt in $(seq 1 5); do
+    if ! launchctl_job_exists "${account}"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+bootstrap_launchctl_plist() {
+  local account="$1"
+  local label plist_path attempt
+  label="$(launchctl_label "${account}")"
+  plist_path="$(launchctl_plist_path "${account}")"
+  [[ -f "${plist_path}" ]] || return 1
+
+  for attempt in $(seq 1 5); do
+    if launchctl_job_exists "${account}"; then
+      break
+    fi
+    launchctl bootstrap "gui/${UID}" "${plist_path}" >/dev/null 2>&1 || true
+    if launchctl_job_exists "${account}"; then
+      break
+    fi
+    sleep 1
+  done
+
+  launchctl enable "gui/${UID}/${label}" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/${UID}/${label}" >/dev/null 2>&1 || true
+}
+
 start_one_launchctl() {
   local account="$1"
-  local pidf logf label pid cmd env_exports
+  local pidf logf label pid cmd env_exports manager
   pidf="$(pid_file "${account}")"
   logf="$(log_file "${account}")"
   label="$(launchctl_label "${account}")"
+  manager="launchctl"
+  if launchctl_plist_exists "${account}"; then
+    manager="launchagent"
+  fi
 
   if is_launchctl_bot_running "${account}"; then
     pid="$(launchctl_job_pid "${account}" || true)"
     rm -f "${pidf}"
-    echo "[skip] ${account} already running (pid=${pid}, manager=launchctl)"
+    echo "[skip] ${account} already running (pid=${pid}, manager=${manager})"
     return 0
   fi
 
   if launchctl_job_exists "${account}"; then
     launchctl remove "${label}" 2>/dev/null || true
+    wait_for_launchctl_absent "${account}" || true
   fi
 
   {
-    echo "[$(date '+%F %T')] starting account=${account} manager=launchctl"
+    echo "[$(date '+%F %T')] starting account=${account} manager=${manager}"
   } >> "${logf}"
 
-  env_exports=''
-  append_export_if_set env_exports ZEROCHAT_API_KEY
-  append_export_if_set env_exports OPENAI_API_KEY
-  append_export_if_set env_exports CODEX_API_KEY
-  append_export_if_set env_exports CODEX_HOME
+  if launchctl_plist_exists "${account}"; then
+    bootstrap_launchctl_plist "${account}"
+  else
+    env_exports=''
+    append_export_if_set env_exports ZEROCHAT_API_KEY
+    append_export_if_set env_exports OPENAI_API_KEY
+    append_export_if_set env_exports CODEX_API_KEY
+    append_export_if_set env_exports CODEX_HOME
 
-  printf -v cmd 'export PATH=%q;%s cd %q; exec %q %q --account %q >> %q 2>&1' \
-    "${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
-    "${env_exports}" \
-    "${REPO_DIR}" \
-    "${NODE_BIN_RESOLVED}" \
-    "${BOT_SCRIPT}" \
-    "${account}" \
-    "${logf}"
-  cmd="export NODE_TLS_REJECT_UNAUTHORIZED=0; ${cmd}"
-  launchctl submit -l "${label}" -- /bin/zsh -lc "${cmd}"
-  sleep 1
-
-  pid="$(launchctl_job_pid "${account}" || true)"
-  if is_bot_pid_for_account "${pid}" "${account}"; then
-    rm -f "${pidf}"
-    echo "[ok] started ${account} (pid=${pid}, manager=launchctl) log=${logf}"
-    return 0
+    printf -v cmd 'export PATH=%q;%s cd %q; exec %q %q --account %q >> %q 2>&1' \
+      "${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
+      "${env_exports}" \
+      "${REPO_DIR}" \
+      "${NODE_BIN_RESOLVED}" \
+      "${BOT_SCRIPT}" \
+      "${account}" \
+      "${logf}"
+    cmd="export NODE_TLS_REJECT_UNAUTHORIZED=0; ${cmd}"
+    launchctl submit -l "${label}" -- /bin/zsh -lc "${cmd}"
   fi
+  for _attempt in $(seq 1 20); do
+    pid="$(launchctl_job_pid "${account}" || true)"
+    if is_bot_pid_for_account "${pid}" "${account}"; then
+      rm -f "${pidf}"
+      echo "[ok] started ${account} (pid=${pid}, manager=${manager}) log=${logf}"
+      return 0
+    fi
+    sleep 0.5
+  done
 
-  echo "[error] failed to start ${account} via launchctl; recent log:" >&2
+  echo "[error] failed to start ${account} via ${manager}; recent log:" >&2
   tail -n 80 "${logf}" >&2 || true
   launchctl remove "${label}" 2>/dev/null || true
   rm -f "${pidf}"
@@ -222,10 +277,14 @@ start_one_launchctl() {
 
 stop_one_launchctl() {
   local account="$1"
-  local pidf label pid i
+  local pidf label pid i manager
   pidf="$(pid_file "${account}")"
   label="$(launchctl_label "${account}")"
   pid="$(launchctl_job_pid "${account}" || true)"
+  manager="launchctl"
+  if launchctl_plist_exists "${account}"; then
+    manager="launchagent"
+  fi
 
   if ! launchctl_job_exists "${account}"; then
     return 1
@@ -235,7 +294,7 @@ stop_one_launchctl() {
   for i in $(seq 1 20); do
     if ! is_running_pid "${pid}"; then
       rm -f "${pidf}"
-      echo "[ok] stopped ${account} (pid=${pid:-none}, manager=launchctl)"
+      echo "[ok] stopped ${account} (pid=${pid:-none}, manager=${manager})"
       return 0
     fi
     sleep 0.25
@@ -245,7 +304,7 @@ stop_one_launchctl() {
     kill -9 "${pid}" 2>/dev/null || true
   fi
   rm -f "${pidf}"
-  echo "[ok] force-stopped ${account} (pid=${pid:-none}, manager=launchctl)"
+  echo "[ok] force-stopped ${account} (pid=${pid:-none}, manager=${manager})"
   return 0
 }
 
@@ -395,20 +454,29 @@ stop_one() {
 
 status_one() {
   local account="$1"
-  local pidf logf pid manual last_exit
+  local pidf logf pid manual last_exit manager plist_path
   pidf="$(pid_file "${account}")"
   logf="$(log_file "${account}")"
+  manager="launchctl"
+  plist_path="$(launchctl_plist_path "${account}")"
+  if launchctl_plist_exists "${account}"; then
+    manager="launchagent"
+  fi
 
   if [[ "${USE_LAUNCHCTL}" == "true" ]]; then
     if is_launchctl_bot_running "${account}"; then
       pid="$(launchctl_job_pid "${account}" || true)"
       rm -f "${pidf}"
-      echo "[running] ${account} pid=${pid} manager=launchctl log=${logf}"
+      echo "[running] ${account} pid=${pid} manager=${manager} log=${logf}"
       return 0
     fi
     if launchctl_job_exists "${account}"; then
       last_exit="$(launchctl_last_exit_status "${account}" || true)"
-      echo "[stopped] ${account} pid=(none) manager=launchctl last_exit=${last_exit:-unknown} log=${logf}"
+      echo "[stopped] ${account} pid=(none) manager=${manager} last_exit=${last_exit:-unknown} log=${logf}"
+      return 0
+    fi
+    if launchctl_plist_exists "${account}"; then
+      echo "[stopped] ${account} pid=(none) manager=launchagent plist=${plist_path} log=${logf}"
       return 0
     fi
   fi

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 const fs = require('fs');
+const https = require('https');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const WebSocket = require('ws');
 const {
   deepMerge,
   readConfigEntry,
@@ -68,6 +70,48 @@ const FEISHU_SEND_IMAGE_DIRECTIVE_PREFIX = '[[FEISHU_SEND_IMAGE:';
 const CODEX_DELEGATE_INLINE_PREFIX = '[[CODEX_DELEGATE:';
 const CODEX_DELEGATE_BLOCK_START = '[[CODEX_DELEGATE]]';
 const CODEX_DELEGATE_BLOCK_END = '[[/CODEX_DELEGATE]]';
+const DEFAULT_NON_CODING_MODEL_ROUTE_TRIGGERS = [
+  '不用Codex',
+  '不用 Codex',
+  '不要Codex',
+  '不要 Codex',
+  '不要用Codex',
+  '不要用 Codex',
+  '别用Codex',
+  '别用 Codex',
+  '非Codex',
+  '非 Codex',
+  '使用其他模型',
+  '用其他模型',
+  '换其他模型',
+  '其他模型',
+  '非编程模型',
+  '不要编程模型',
+  '不用编程模型',
+];
+const DEFAULT_WRITING_MODEL_ROUTE_TRIGGERS = [
+  '写公众号文章',
+  '公众号文章',
+  '写一篇公众号',
+  '撰写公众号',
+  '生成公众号文章',
+  '写长文',
+  '撰写长文',
+  '长文Markdown',
+  '长文 Markdown',
+  'Markdown正文',
+  'Markdown 正文',
+  '生成正文',
+  '写正文',
+  '写成文章',
+  '写成稿',
+  '文章草稿',
+  '成稿',
+  '出稿',
+  '尝鲜派风格',
+  'iBETA风格',
+  'iBETA 风格',
+];
 const FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS = 15 * 1000;
 const FEISHU_DOCX_TEXT_BLOCK_TYPE = 2;
 const FEISHU_DOCX_HEADING2_BLOCK_TYPE = 4;
@@ -75,6 +119,37 @@ const FEISHU_DOCX_HEADING3_BLOCK_TYPE = 5;
 const FEISHU_DOCX_CODE_BLOCK_TYPE = 14;
 const VALID_CODEX_SANDBOXES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const VALID_CODEX_APPROVAL_POLICIES = new Set(['untrusted', 'on-failure', 'on-request', 'never']);
+
+function patchWsClientTlsBypass(wsClient) {
+  if (!wsClient || process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') return wsClient;
+  wsClient.connect = function patchedConnect() {
+    const connectUrl = this.wsConfig.getWS('connectUrl');
+    let wsInstance;
+    try {
+      const { agent } = this;
+      wsInstance = new WebSocket(connectUrl, {
+        agent,
+        rejectUnauthorized: false,
+      });
+    } catch (_) {
+      this.logger.error('[ws]', 'new WebSocket error');
+    }
+    if (!wsInstance) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      wsInstance.on('open', () => {
+        this.logger.debug('[ws]', 'ws connect success');
+        this.wsConfig.setWSInstance(wsInstance);
+        this.pingLoop();
+        resolve(true);
+      });
+      wsInstance.on('error', () => {
+        this.logger.error('[ws]', 'ws connect failed');
+        resolve(false);
+      });
+    });
+  };
+  return wsClient;
+}
 const VALID_PROGRESS_DOC_LINK_SCOPES = new Set(['same_tenant', 'anyone', 'closed']);
 const IMAGE_FILE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.tif', '.tiff', '.bmp', '.ico']);
 const TRANSCRIPTION_MIME_BY_EXTENSION = new Map([
@@ -100,7 +175,8 @@ const CONTENT_TYPE_EXTENSION_MAP = new Map([
 const REPO_DIR = path.resolve(__dirname, '..');
 const FEISHU_RUNTIME_DIR = path.join(REPO_DIR, '.runtime', 'feishu');
 const FEISHU_MEMORY_DIR = path.join(FEISHU_RUNTIME_DIR, 'memory');
-const FEISHU_INCOMING_ATTACHMENT_DIR = path.join(os.homedir(), 'Downloads', 'SunCodexClaw', 'feishu');
+const FEISHU_WORKSPACE_ROOT = path.join(os.homedir(), 'Downloads', 'SunCodexClaw', 'feishu');
+const FEISHU_INCOMING_ATTACHMENT_DIR = FEISHU_WORKSPACE_ROOT;
 const FEISHU_MEMORY_HEADER = '<<SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_FOOTER = '<<END_SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_SCOPE_PROFILE = 'profile_facts';
@@ -480,7 +556,151 @@ function resolveCodexConfig(config) {
     apiKeySource: apiKey.source,
     sandbox,
     approvalPolicy,
+    modelRoutes: resolveCodexModelRoutes(codexConfig),
   };
+}
+
+function normalizeModelRouteKeywords(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeString(item)).filter(Boolean);
+  }
+  const text = normalizeString(value);
+  if (!text) return [];
+  return text
+    .split(/[\n,，、|]+/g)
+    .map((item) => normalizeString(item))
+    .filter(Boolean);
+}
+
+function resolveCodexModelRoutes(codexConfig = {}) {
+  const routes = codexConfig.model_routes || codexConfig.modelRoutes || {};
+  const writingRaw = routes.writing_request
+    || routes.writingRequest
+    || routes.writing
+    || {};
+  const nonCodingRaw = routes.non_coding_request
+    || routes.nonCodingRequest
+    || routes.non_coding
+    || routes.nonCoding
+    || {};
+  const hasWritingRoute = writingRaw && Object.keys(writingRaw).length > 0;
+  const hasNonCodingRoute = nonCodingRaw && Object.keys(nonCodingRaw).length > 0;
+  const writingModel = normalizeString(
+    getArg(
+      '--codex-writing-model',
+      process.env.FEISHU_CODEX_WRITING_MODEL || writingRaw.model || ''
+    )
+  );
+  const writingReasoningEffort = normalizeString(
+    getArg(
+      '--codex-writing-reasoning-effort',
+      process.env.FEISHU_CODEX_WRITING_REASONING_EFFORT || writingRaw.reasoning_effort || writingRaw.reasoningEffort || ''
+    )
+  );
+  const nonCodingModel = normalizeString(
+    getArg(
+      '--codex-non-coding-model',
+      process.env.FEISHU_CODEX_NON_CODING_MODEL || nonCodingRaw.model || ''
+    )
+  );
+  const nonCodingReasoningEffort = normalizeString(
+    getArg(
+      '--codex-non-coding-reasoning-effort',
+      process.env.FEISHU_CODEX_NON_CODING_REASONING_EFFORT || nonCodingRaw.reasoning_effort || nonCodingRaw.reasoningEffort || ''
+    )
+  );
+  const writingConfiguredTriggers = normalizeModelRouteKeywords(
+    writingRaw.trigger_keywords
+      || writingRaw.triggerKeywords
+      || writingRaw.triggers
+      || writingRaw.keywords
+      || ''
+  );
+  const configuredTriggers = normalizeModelRouteKeywords(
+    nonCodingRaw.trigger_keywords
+      || nonCodingRaw.triggerKeywords
+      || nonCodingRaw.triggers
+      || nonCodingRaw.keywords
+      || ''
+  );
+  return {
+    writingRequest: {
+      enabled: asBool(writingRaw.enabled, hasWritingRoute || Boolean(writingModel)),
+      model: writingModel,
+      reasoningEffort: writingReasoningEffort,
+      triggerKeywords: uniqueStrings([
+        ...DEFAULT_WRITING_MODEL_ROUTE_TRIGGERS,
+        ...writingConfiguredTriggers,
+      ]),
+    },
+    nonCodingRequest: {
+      enabled: asBool(nonCodingRaw.enabled, hasNonCodingRoute || Boolean(nonCodingModel)),
+      model: nonCodingModel,
+      reasoningEffort: nonCodingReasoningEffort,
+      triggerKeywords: uniqueStrings([
+        ...DEFAULT_NON_CODING_MODEL_ROUTE_TRIGGERS,
+        ...configuredTriggers,
+      ]),
+    },
+  };
+}
+
+function normalizeModelRouteTriggerText(value) {
+  return normalizeString(value).toLowerCase().replace(/\s+/g, '');
+}
+
+function matchesModelRouteTrigger(text, keywords = []) {
+  const raw = normalizeString(text);
+  if (!raw) return '';
+  const normalizedText = normalizeModelRouteTriggerText(raw);
+  for (const keyword of keywords || []) {
+    const normalizedKeyword = normalizeModelRouteTriggerText(keyword);
+    if (!normalizedKeyword) continue;
+    if (normalizedText.includes(normalizedKeyword)) return keyword;
+  }
+  return '';
+}
+
+function selectCodexConfigForUserText(codex, userText = '') {
+  const candidates = [
+    ['writing_request', codex?.modelRoutes?.writingRequest || {}],
+    ['non_coding_request', codex?.modelRoutes?.nonCodingRequest || {}],
+  ];
+  for (const [name, route] of candidates) {
+    if (!route.enabled) continue;
+    const matchedKeyword = matchesModelRouteTrigger(userText, route.triggerKeywords || []);
+    if (!matchedKeyword) continue;
+    const model = normalizeString(route.model) || normalizeString(codex.model);
+    const reasoningEffort = normalizeString(route.reasoningEffort) || normalizeString(codex.reasoningEffort);
+    if (!model && !reasoningEffort) continue;
+    return {
+      ...codex,
+      model,
+      reasoningEffort,
+      activeModelRoute: {
+        name,
+        matchedKeyword,
+        model,
+        reasoningEffort,
+      },
+    };
+  }
+  return codex;
+}
+
+function printCodexModelRouteConfig(codex) {
+  const writingRoute = codex?.modelRoutes?.writingRequest || {};
+  const writingTriggerCount = Array.isArray(writingRoute.triggerKeywords) ? writingRoute.triggerKeywords.length : 0;
+  console.log(`codex_writing_route=${writingRoute.enabled ? 'true' : 'false'}`);
+  console.log(`codex_writing_model=${writingRoute.model || '(default)'}`);
+  console.log(`codex_writing_reasoning_effort=${writingRoute.reasoningEffort || '(default)'}`);
+  console.log(`codex_writing_trigger_count=${writingTriggerCount}`);
+  const route = codex?.modelRoutes?.nonCodingRequest || {};
+  const triggerCount = Array.isArray(route.triggerKeywords) ? route.triggerKeywords.length : 0;
+  console.log(`codex_non_coding_route=${route.enabled ? 'true' : 'false'}`);
+  console.log(`codex_non_coding_model=${route.model || '(default)'}`);
+  console.log(`codex_non_coding_reasoning_effort=${route.reasoningEffort || '(default)'}`);
+  console.log(`codex_non_coding_trigger_count=${triggerCount}`);
 }
 
 function resolveLocalModelConfig(config) {
@@ -2148,12 +2368,43 @@ function sanitizeLocalFileName(rawName, fallback = 'attachment.bin') {
   return cleaned.slice(0, 180);
 }
 
-function buildIncomingAttachmentDir(accountName = '', messageType = '', messageID = '') {
+function buildDefaultFeishuWorkspaceDir(accountName = '') {
   const safeAccount = sanitizeLocalFileName(String(accountName || 'default').trim() || 'default', 'default');
+  return path.join(FEISHU_WORKSPACE_ROOT, safeAccount);
+}
+
+function resolveFeishuWorkspaceConfig(config, accountName = '') {
+  const workspaceConfig = config.workspace || {};
+  const rawDir = getArg(
+    '--workspace-dir',
+    process.env.FEISHU_WORKSPACE_DIR
+      || workspaceConfig.dir
+      || config.workspace_dir
+      || config.file_workspace_dir
+      || ''
+  );
+  const dir = resolveOptionalPath(rawDir || buildDefaultFeishuWorkspaceDir(accountName), REPO_DIR);
+  return {
+    dir,
+    incomingDir: path.join(dir, 'incoming'),
+    outputDir: path.join(dir, 'outputs'),
+    tempDir: path.join(dir, 'tmp'),
+  };
+}
+
+function ensureFeishuWorkspaceDirs(workspace) {
+  for (const dirPath of [workspace?.dir, workspace?.incomingDir, workspace?.outputDir, workspace?.tempDir]) {
+    if (!dirPath) continue;
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+function buildIncomingAttachmentDir(workspaceDir = '', accountName = '', messageType = '', messageID = '') {
   const safeType = sanitizeLocalFileName(String(messageType || 'attachment').trim() || 'attachment', 'attachment');
   const dateText = new Date().toISOString().slice(0, 10);
   const safeMessageID = sanitizeLocalFileName(String(messageID || '').trim() || `${Date.now()}`, 'message');
-  return path.join(FEISHU_INCOMING_ATTACHMENT_DIR, safeAccount, 'incoming', dateText, safeType, safeMessageID);
+  const baseDir = workspaceDir ? path.resolve(workspaceDir) : buildDefaultFeishuWorkspaceDir(accountName);
+  return path.join(baseDir, 'incoming', dateText, safeType, safeMessageID);
 }
 
 function buildUniqueFilePath(dirPath, rawName, fallback = 'attachment.bin') {
@@ -3743,6 +3994,7 @@ function buildCodexPrompt({
   imageCount = 0,
   cwd = '',
   addDirs = [],
+  fileWorkspaceDir = '',
   threadTitle = '',
   forceExecution = false,
   memoryBundleText = '',
@@ -3762,6 +4014,10 @@ function buildCodexPrompt({
   }
   lines.push('');
   lines.push(`当前工作目录：${cwd || process.cwd()}`);
+  if (fileWorkspaceDir) {
+    lines.push(`机器人文件工作目录：${fileWorkspaceDir}`);
+    lines.push('生成文件、整理附件或需要返回本地文件时，优先保存到机器人文件工作目录；发送附件指令请使用绝对路径。');
+  }
   if (Array.isArray(addDirs) && addDirs.length > 0) {
     lines.push(`额外可访问目录：${addDirs.join(' | ')}`);
   }
@@ -3824,6 +4080,7 @@ function buildLocalModelPrompt({
 function buildCodexResumePrompt({
   userText,
   imageCount = 0,
+  fileWorkspaceDir = '',
   forceExecution = false,
   memoryBundleText = '',
   thingsCommandHint = '',
@@ -3835,6 +4092,11 @@ function buildCodexResumePrompt({
     lines.push('');
   }
   lines.push('继续当前线程，直接回复用户。');
+  if (fileWorkspaceDir) {
+    lines.push('');
+    lines.push(`机器人文件工作目录：${fileWorkspaceDir}`);
+    lines.push('生成文件、整理附件或需要返回本地文件时，优先保存到机器人文件工作目录；发送附件指令请使用绝对路径。');
+  }
   if (memoryBundleText) {
     lines.push('');
     lines.push('本地记忆（按机器人独立存储，跨线程共享）：');
@@ -4105,6 +4367,7 @@ async function generateCodexReply({
   imagePaths = [],
   sessionId = '',
   threadTitle = '',
+  fileWorkspaceDir = '',
   forceExecution = false,
   memoryBundleText = '',
   thingsCommandHint = '',
@@ -4113,6 +4376,13 @@ async function generateCodexReply({
   throwIfCancelled = null,
 }) {
   let resolvedSessionId = String(sessionId || '').trim();
+  const activeCodex = selectCodexConfigForUserText(codex, userText);
+  if (activeCodex?.activeModelRoute) {
+    const route = activeCodex.activeModelRoute;
+    console.log(
+      `codex_model_route=${route.name} matched=${JSON.stringify(route.matchedKeyword || '')} model=${route.model || '(default)'} reasoning_effort=${route.reasoningEffort || '(default)'}`
+    );
+  }
   const imageCount = Array.isArray(imagePaths) ? imagePaths.length : 0;
   const ensureNotCancelled = typeof throwIfCancelled === 'function'
     ? throwIfCancelled
@@ -4120,15 +4390,15 @@ async function generateCodexReply({
   const runExec = async ({ prompt, resumeSessionId = '' }) => {
     ensureNotCancelled();
     return runCodexExec({
-      bin: codex.bin,
-      model: codex.model,
-      reasoningEffort: codex.reasoningEffort,
-      profile: codex.profile,
-      cwd: codex.cwd,
-      addDirs: codex.addDirs,
-      apiKey: codex.apiKey,
-      sandbox: codex.sandbox,
-      approvalPolicy: codex.approvalPolicy,
+      bin: activeCodex.bin,
+      model: activeCodex.model,
+      reasoningEffort: activeCodex.reasoningEffort,
+      profile: activeCodex.profile,
+      cwd: activeCodex.cwd,
+      addDirs: activeCodex.addDirs,
+      apiKey: activeCodex.apiKey,
+      sandbox: activeCodex.sandbox,
+      approvalPolicy: activeCodex.approvalPolicy,
       prompt,
       imagePaths,
       resumeSessionId,
@@ -4139,8 +4409,8 @@ async function generateCodexReply({
 
   if (resolvedSessionId) {
     const existingPolicy = readCodexThreadExecutionPolicy(resolvedSessionId);
-    const expectedSandboxType = String(codex.sandbox || '').trim();
-    const expectedApprovalMode = String(codex.approvalPolicy || '').trim();
+    const expectedSandboxType = String(activeCodex.sandbox || '').trim();
+    const expectedApprovalMode = String(activeCodex.approvalPolicy || '').trim();
     if (
       !existingPolicy
       || (expectedSandboxType && existingPolicy.sandboxType && existingPolicy.sandboxType !== expectedSandboxType)
@@ -4157,6 +4427,7 @@ async function generateCodexReply({
         prompt: buildCodexResumePrompt({
           userText,
           imageCount,
+          fileWorkspaceDir,
           forceExecution,
           memoryBundleText,
           thingsCommandHint,
@@ -4176,12 +4447,13 @@ async function generateCodexReply({
   ensureNotCancelled();
   const fresh = await runExec({
     prompt: buildCodexPrompt({
-      systemPrompt: codex.systemPrompt,
+      systemPrompt: activeCodex.systemPrompt,
       history,
       userText,
       imageCount,
-      cwd: codex.cwd,
-      addDirs: codex.addDirs,
+      cwd: activeCodex.cwd,
+      addDirs: activeCodex.addDirs,
+      fileWorkspaceDir,
       threadTitle,
       forceExecution,
       memoryBundleText,
@@ -5399,6 +5671,7 @@ function createProgressReporter({
 
 async function downloadImageToDownloads(client, {
   accountName = '',
+  workspaceDir = '',
   messageID = '',
   imageKey = '',
   fileName = '',
@@ -5412,7 +5685,7 @@ async function downloadImageToDownloads(client, {
       file_key: imageKey,
     },
   });
-  const dirPath = buildIncomingAttachmentDir(accountName, 'image', messageID);
+  const dirPath = buildIncomingAttachmentDir(workspaceDir, accountName, 'image', messageID);
   fs.mkdirSync(dirPath, { recursive: true });
   const ext = inferExtensionFromHeaders(resource.headers, '.jpg');
   const preferredName = fileName
@@ -5453,6 +5726,7 @@ async function getMessageItemSafe(client, messageID, logTag = 'message_get') {
 
 async function downloadFileToDownloads(client, {
   accountName = '',
+  workspaceDir = '',
   messageID = '',
   fileKey = '',
   fileName = '',
@@ -5466,7 +5740,7 @@ async function downloadFileToDownloads(client, {
       file_key: fileKey,
     },
   });
-  const dirPath = buildIncomingAttachmentDir(accountName, 'file', messageID);
+  const dirPath = buildIncomingAttachmentDir(workspaceDir, accountName, 'file', messageID);
   fs.mkdirSync(dirPath, { recursive: true });
   const fallbackExt = inferExtensionFromHeaders(resource.headers, path.extname(fileName || '') || '.bin');
   const { filePath, fileName: storedFileName } = buildUniqueFilePath(
@@ -5738,6 +6012,7 @@ async function main() {
   const typing = resolveTypingConfig(config);
   const mentionConfig = resolveMentionConfig(config);
   const fakeStream = resolveFakeStreamConfig(config);
+  const workspace = resolveFeishuWorkspaceConfig(config, accountName);
 
   const creds = resolveCredentials(config);
   const codex = resolveCodexConfig(config);
@@ -5780,6 +6055,10 @@ async function main() {
     console.log(`mention_aliases=${mentionAliases.length > 0 ? mentionAliases.join(' | ') : '(none)'}`);
     console.log(`reply_mode=${replyMode}`);
     console.log(`reply_prefix=${String(replyPrefix)}`);
+    console.log(`workspace_dir=${workspace.dir}`);
+    console.log(`workspace_incoming_dir=${workspace.incomingDir}`);
+    console.log(`workspace_output_dir=${workspace.outputDir}`);
+    console.log(`workspace_temp_dir=${workspace.tempDir}`);
     console.log(`typing_indicator=${typing.enabled ? 'true' : 'false'}`);
     console.log(`typing_emoji=${typing.emoji}`);
     console.log(`fake_stream=${fakeStream.enabled ? 'true' : 'false'}`);
@@ -5803,6 +6082,7 @@ async function main() {
     if (codex.apiKeySource) console.log(`codex_api_key_source=${codex.apiKeySource}`);
     console.log(`codex_model=${codex.model || '(default)'}`);
     console.log(`codex_reasoning_effort=${codex.reasoningEffort || '(default)'}`);
+    printCodexModelRouteConfig(codex);
     console.log(`codex_profile=${codex.profile || '(default)'}`);
     console.log(`codex_cwd=${codex.cwd || process.cwd()}`);
     console.log(`codex_add_dirs=${codex.addDirs.length > 0 ? codex.addDirs.join(' | ') : '(none)'}`);
@@ -5856,6 +6136,7 @@ async function main() {
     ensure(localModelDetect.cwdFound, `local model cwd not found: ${localModel.cwd || '(missing)'}`);
     ensure(localModelDetect.promptScriptFound, `local model prompt script not found: ${localModel.promptScript || '(missing)'}`);
   }
+  ensureFeishuWorkspaceDirs(workspace);
 
   const baseConfig = {
     appId: creds.appId.value,
@@ -6053,6 +6334,7 @@ async function main() {
         try {
           const downloaded = await downloadFileToDownloads(client, {
             accountName,
+            workspaceDir: workspace.dir,
             messageID,
             fileKey: descriptor.fileKey,
             fileName: descriptor.fileName,
@@ -6081,6 +6363,7 @@ async function main() {
         try {
           const downloaded = await downloadImageToDownloads(client, {
             accountName,
+            workspaceDir: workspace.dir,
             messageID,
             imageKey,
             fileName: `image-${index + 1}.jpg`,
@@ -6401,6 +6684,7 @@ async function main() {
           imagePaths,
           sessionId: currentThread.codexThreadId,
           threadTitle: codexThreadTitle,
+          fileWorkspaceDir: workspace.dir,
           forceExecution,
           memoryBundleText,
           thingsCommandHint,
@@ -6449,6 +6733,7 @@ async function main() {
             imagePaths,
             sessionId: currentThread.codexThreadId,
             threadTitle: codexThreadTitle,
+            fileWorkspaceDir: workspace.dir,
             forceExecution: true,
             memoryBundleText,
             thingsCommandHint,
@@ -6501,6 +6786,7 @@ async function main() {
               imagePaths,
               sessionId: currentThread.codexThreadId,
               threadTitle: codexThreadTitle,
+              fileWorkspaceDir: workspace.dir,
               forceExecution: true,
               memoryBundleText,
               thingsCommandHint,
@@ -6694,11 +6980,14 @@ async function main() {
     },
   });
 
-  const wsClient = new lark.WSClient({
+  const wsClient = patchWsClientTlsBypass(new lark.WSClient({
     ...baseConfig,
+    agent: process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0'
+      ? new https.Agent({ rejectUnauthorized: false })
+      : undefined,
     autoReconnect: true,
     loggerLevel: lark.LoggerLevel.info,
-  });
+  }));
 
   let stopping = false;
   function stop(signal) {
@@ -6726,6 +7015,10 @@ async function main() {
   console.log(`bot_open_id_autodetect=${mentionConfig.requireMention ? 'enabled' : 'not_needed'}`);
   console.log(`mention_aliases=${mentionAliases.length > 0 ? mentionAliases.join(' | ') : '(none)'}`);
   console.log(`reply_mode=${replyMode}`);
+  console.log(`workspace_dir=${workspace.dir}`);
+  console.log(`workspace_incoming_dir=${workspace.incomingDir}`);
+  console.log(`workspace_output_dir=${workspace.outputDir}`);
+  console.log(`workspace_temp_dir=${workspace.tempDir}`);
   console.log(`typing_indicator=${typing.enabled ? 'true' : 'false'}`);
   console.log(`fake_stream=${fakeStream.enabled ? 'true' : 'false'}`);
   console.log(`local_model_cwd=${localModel.cwd || '(missing)'}`);
@@ -6746,6 +7039,7 @@ async function main() {
     console.log(`codex_bin=${codex.bin}`);
     console.log(`codex_model=${codex.model || '(default)'}`);
     console.log(`codex_reasoning_effort=${codex.reasoningEffort || '(default)'}`);
+    printCodexModelRouteConfig(codex);
     console.log(`codex_profile=${codex.profile || '(default)'}`);
     console.log(`codex_cwd=${codex.cwd || process.cwd()}`);
     console.log(`codex_add_dirs=${codex.addDirs.length > 0 ? codex.addDirs.join(' | ') : '(none)'}`);

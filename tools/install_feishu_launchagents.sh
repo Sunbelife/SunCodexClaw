@@ -12,6 +12,10 @@ PATH_VALUE="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
 CODEX_BIN="${CODEX_BIN:-$(command -v codex || true)}"
 CODEX_HOME_VALUE="${CODEX_HOME:-${HOME}/.codex}"
+OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
+CODEX_API_KEY_VALUE="${CODEX_API_KEY:-}"
+ZEROCHAT_API_KEY_VALUE="${ZEROCHAT_API_KEY:-}"
+NODE_TLS_REJECT_UNAUTHORIZED_VALUE="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
 LAUNCHCTL_PREFIX="${SUNCODEXCLAW_LAUNCHCTL_PREFIX:-com.sunbelife.suncodexclaw.feishu}"
 
 usage() {
@@ -24,7 +28,7 @@ Usage:
 Notes:
   - account defaults to all
   - launch agents are installed to ~/Library/LaunchAgents
-  - each account gets a dedicated com.sunbelife.nootag.feishu.<account> plist
+  - each account gets a dedicated com.sunbelife.suncodexclaw.feishu.<account> plist
 USAGE
 }
 
@@ -62,6 +66,10 @@ log_for_account() {
   printf '%s/%s.log\n' "${LOG_DIR}" "$1"
 }
 
+xml_escape_attr() {
+  xml_escape "$1"
+}
+
 xml_escape() {
   local value="${1:-}"
   value="${value//&/&amp;}"
@@ -72,12 +80,27 @@ xml_escape() {
 
 write_plist() {
   local account="$1"
-  local label plist_path log_path
+  local label plist_path log_path shell_cmd env_exports
   label="$(label_for_account "${account}")"
   plist_path="$(plist_for_account "${account}")"
   log_path="$(log_for_account "${account}")"
 
   mkdir -p "${PLIST_DIR}" "${LOG_DIR}"
+
+  env_exports=''
+  if [[ -n "${ZEROCHAT_API_KEY_VALUE}" ]]; then
+    env_exports="${env_exports} export ZEROCHAT_API_KEY=$(printf '%q' "${ZEROCHAT_API_KEY_VALUE}");"
+  fi
+  if [[ -n "${OPENAI_API_KEY_VALUE}" ]]; then
+    env_exports="${env_exports} export OPENAI_API_KEY=$(printf '%q' "${OPENAI_API_KEY_VALUE}");"
+  fi
+  if [[ -n "${CODEX_API_KEY_VALUE}" ]]; then
+    env_exports="${env_exports} export CODEX_API_KEY=$(printf '%q' "${CODEX_API_KEY_VALUE}");"
+  fi
+  if [[ -n "${CODEX_HOME_VALUE}" ]]; then
+    env_exports="${env_exports} export CODEX_HOME=$(printf '%q' "${CODEX_HOME_VALUE}");"
+  fi
+  shell_cmd="export NODE_TLS_REJECT_UNAUTHORIZED=$(printf '%q' "${NODE_TLS_REJECT_UNAUTHORIZED_VALUE}"); export PATH=$(printf '%q' "${PATH_VALUE}");${env_exports} cd $(printf '%q' "${REPO_DIR}"); exec $(printf '%q' "${NODE_BIN}") $(printf '%q' "${BOT_SCRIPT}") --account $(printf '%q' "${account}")"
 
   cat > "${plist_path}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -88,10 +111,9 @@ write_plist() {
   <string>$(xml_escape "${label}")</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$(xml_escape "${NODE_BIN}")</string>
-    <string>$(xml_escape "${BOT_SCRIPT}")</string>
-    <string>--account</string>
-    <string>$(xml_escape "${account}")</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>$(xml_escape "${shell_cmd}")</string>
   </array>
   <key>WorkingDirectory</key>
   <string>$(xml_escape "${REPO_DIR}")</string>
@@ -103,8 +125,16 @@ write_plist() {
     <string>$(xml_escape "${HOME}")</string>
     <key>CODEX_HOME</key>
     <string>$(xml_escape "${CODEX_HOME_VALUE}")</string>
+    <key>NODE_TLS_REJECT_UNAUTHORIZED</key>
+    <string>$(xml_escape "${NODE_TLS_REJECT_UNAUTHORIZED_VALUE}")</string>
     <key>FEISHU_CODEX_BIN</key>
     <string>$(xml_escape "${CODEX_BIN}")</string>
+    <key>OPENAI_API_KEY</key>
+    <string>$(xml_escape "${OPENAI_API_KEY_VALUE}")</string>
+    <key>CODEX_API_KEY</key>
+    <string>$(xml_escape "${CODEX_API_KEY_VALUE}")</string>
+    <key>ZEROCHAT_API_KEY</key>
+    <string>$(xml_escape "${ZEROCHAT_API_KEY_VALUE}")</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

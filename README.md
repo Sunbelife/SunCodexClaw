@@ -385,9 +385,14 @@ bash tools/feishu_bot_ctl.sh stop all
 
 ## 开机自启
 
-macOS 下可以安装 LaunchAgents：
+macOS 下推荐只使用持久 `LaunchAgent`，不要再依赖临时 `launchctl submit` 任务。
+
+安装全部飞书机器人：
 
 ```bash
+NODE_BIN=/usr/local/bin/node \
+CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex \
+NODE_TLS_REJECT_UNAUTHORIZED=0 \
 bash tools/install_feishu_launchagents.sh install all
 ```
 
@@ -395,6 +400,7 @@ bash tools/install_feishu_launchagents.sh install all
 
 ```bash
 bash tools/install_feishu_launchagents.sh status all
+bash tools/feishu_bot_ctl.sh status all
 ```
 
 默认 label 前缀是：
@@ -402,6 +408,10 @@ bash tools/install_feishu_launchagents.sh status all
 ```text
 com.sunbelife.suncodexclaw.feishu
 ```
+
+详细部署和排障手册见：
+
+- [docs/feishu-bot-deployment.md](docs/feishu-bot-deployment.md)
 
 ## 消息能力
 
