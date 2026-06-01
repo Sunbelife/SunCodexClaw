@@ -2,6 +2,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { mergeTalkNormalPrompt } = require('./talk_normal_prompt');
 
 let lark = null;
 try {
@@ -55,6 +56,342 @@ function compactText(value, maxLength = 320) {
   return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function readTextFileIfExists(filePath) {
+  const target = normalizeString(filePath);
+  if (!target) return '';
+  try {
+    return fs.readFileSync(target, 'utf8');
+  } catch (_) {
+    return '';
+  }
+}
+
+function writeTextFileIfChanged(filePath, nextContent) {
+  const target = normalizeString(filePath);
+  if (!target) return false;
+  const normalizedNext = String(nextContent || '');
+  const previous = readTextFileIfExists(target);
+  if (previous === normalizedNext) return false;
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, normalizedNext, 'utf8');
+  return true;
+}
+
+function readCodexAuthSummary(codexHome = '') {
+  const resolvedHome = normalizeString(codexHome)
+    ? path.resolve(codexHome)
+    : path.join(os.homedir(), '.codex');
+  const authPath = path.join(resolvedHome, 'auth.json');
+  const authText = readTextFileIfExists(authPath);
+  const summary = {
+    home: resolvedHome,
+    authPath,
+    exists: Boolean(authText),
+    authMode: '',
+    openaiApiKey: '',
+    hasTokens: false,
+  };
+  if (!authText) return summary;
+
+  try {
+    const parsed = JSON.parse(authText);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return summary;
+    summary.authMode = normalizeString(parsed.auth_mode);
+    summary.openaiApiKey = normalizeString(parsed.OPENAI_API_KEY);
+    summary.hasTokens = Boolean(parsed.tokens && typeof parsed.tokens === 'object');
+  } catch (_) {
+    return summary;
+  }
+  return summary;
+}
+
+function escapeRegExp(rawText) {
+  return String(rawText || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseSimpleTomlValue(rawValue) {
+  const text = String(rawValue || '').trim();
+  if (!text) return '';
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
+
+function readCodexHomeConfigSummary(codexHome = '') {
+  const resolvedHome = normalizeString(codexHome)
+    ? path.resolve(codexHome)
+    : path.join(os.homedir(), '.codex');
+  const configPath = path.join(resolvedHome, 'config.toml');
+  const configText = readTextFileIfExists(configPath);
+  const summary = {
+    home: resolvedHome,
+    configPath,
+    exists: Boolean(configText),
+    modelProvider: '',
+    providerName: '',
+    providerBaseUrl: '',
+  };
+  if (!configText) return summary;
+
+  const providerMatch = configText.match(/^\s*model_provider\s*=\s*(.+)\s*$/m);
+  summary.modelProvider = parseSimpleTomlValue(providerMatch?.[1] || '');
+  if (!summary.modelProvider) return summary;
+
+  const providerPattern = new RegExp(
+    `^\\s*\\[model_providers\\.${escapeRegExp(summary.modelProvider)}\\]\\s*$([\\s\\S]*?)(?=^\\s*\\[[^\\]]+\\]\\s*$|$)`,
+    'm'
+  );
+  const sectionMatch = configText.match(providerPattern);
+  const sectionText = sectionMatch?.[1] || '';
+  if (!sectionText) return summary;
+
+  const providerNameMatch = sectionText.match(/^\s*name\s*=\s*(.+)\s*$/m);
+  const providerBaseUrlMatch = sectionText.match(/^\s*base_url\s*=\s*(.+)\s*$/m);
+  summary.providerName = parseSimpleTomlValue(providerNameMatch?.[1] || '');
+  summary.providerBaseUrl = parseSimpleTomlValue(providerBaseUrlMatch?.[1] || '');
+  return summary;
+}
+
+function deriveCodexRuntimeProvider(codex = {}) {
+  const homeSummary = readCodexHomeConfigSummary(codex.home || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+  const provider = homeSummary.modelProvider || normalizeString(process.env.FEISHU_CODEX_PROVIDER || process.env.CODEX_MODEL_PROVIDER);
+  const providerName = homeSummary.providerName || provider;
+  return {
+    provider,
+    providerName,
+    providerBaseUrl: homeSummary.providerBaseUrl,
+    codexHome: homeSummary.home,
+    configPath: homeSummary.configPath,
+  };
+}
+
+function selectCodexApiKey(codex = {}) {
+  const runtimeProvider = deriveCodexRuntimeProvider(codex);
+  const provider = normalizeString(runtimeProvider.provider).toLowerCase();
+  const primaryAuth = readCodexAuthSummary(runtimeProvider.codexHome || codex.home || '');
+  const defaultAuthHome = path.join(os.homedir(), '.codex');
+  const fallbackAuth = path.resolve(primaryAuth.home || '') === path.resolve(defaultAuthHome)
+    ? { openaiApiKey: '' }
+    : readCodexAuthSummary(defaultAuthHome);
+  const candidates = [];
+
+  if (provider === 'zerochat') {
+    candidates.push(['env_zerochat', process.env.ZEROCHAT_API_KEY || '']);
+    candidates.push(['env_openai', process.env.OPENAI_API_KEY || '']);
+    candidates.push(['env_codex', process.env.CODEX_API_KEY || '']);
+  } else {
+    candidates.push(['env_openai', process.env.OPENAI_API_KEY || '']);
+    candidates.push(['env_codex', process.env.CODEX_API_KEY || '']);
+    candidates.push(['auth_home', primaryAuth.openaiApiKey || '']);
+    candidates.push(['auth_default', fallbackAuth.openaiApiKey || '']);
+  }
+  candidates.push(['config', codex.api_key || codex.apiKey || '']);
+
+  for (const [source, raw] of candidates) {
+    const value = normalizeString(raw);
+    if (!value) continue;
+    return {
+      value,
+      source,
+      runtimeProvider,
+    };
+  }
+  return {
+    value: '',
+    source: '',
+    runtimeProvider,
+  };
+}
+
+function syncCodexHomeProviderConfig(configuredHome) {
+  const targetHome = normalizeString(configuredHome) ? path.resolve(configuredHome) : '';
+  if (!targetHome) return { changed: false, skipped: true, reason: 'home_missing' };
+
+  const defaultHome = path.join(os.homedir(), '.codex');
+  const sourceConfigPath = path.join(defaultHome, 'config.toml');
+  const targetConfigPath = path.join(targetHome, 'config.toml');
+  if (path.resolve(sourceConfigPath) === path.resolve(targetConfigPath)) {
+    return { changed: false, skipped: true, reason: 'same_config' };
+  }
+
+  const sourceText = readTextFileIfExists(sourceConfigPath);
+  const targetText = readTextFileIfExists(targetConfigPath);
+  if (!sourceText || !targetText) {
+    return {
+      changed: false,
+      skipped: true,
+      reason: !sourceText ? 'source_config_missing' : 'target_config_missing',
+    };
+  }
+
+  const sourceProviderMatch = sourceText.match(/^\s*model_provider\s*=\s*(.+)\s*$/m);
+  const sourceProvider = parseSimpleTomlValue(sourceProviderMatch?.[1] || '');
+  if (!sourceProvider) {
+    let nextText = targetText;
+    nextText = nextText.replace(/^\s*model_provider\s*=.*\n?/gm, '');
+    nextText = nextText.replace(/^\s*\[model_providers\.[^\]]+\]\s*$[\s\S]*?(?=^\s*\[[^\]]+\]\s*$|$)/gm, '');
+    nextText = nextText.replace(/^(?:\s*(?:name|base_url|wire_api|requires_openai_auth)\s*=.*\n)+/m, '');
+    nextText = nextText.replace(/\n{3,}/g, '\n\n').trim();
+    if (nextText) nextText = `${nextText}\n`;
+    const changed = writeTextFileIfChanged(targetConfigPath, nextText);
+    return {
+      changed,
+      skipped: false,
+      reason: changed ? 'cleared_stale_provider' : 'provider_already_cleared',
+      targetConfigPath,
+    };
+  }
+
+  const sourceSectionPattern = new RegExp(
+    `^\\s*\\[model_providers\\.${escapeRegExp(sourceProvider)}\\]\\s*$([\\s\\S]*?)(?=^\\s*\\[[^\\]]+\\]\\s*$|$)`,
+    'm'
+  );
+  const sourceSectionMatch = sourceText.match(sourceSectionPattern);
+  if (!sourceSectionMatch) {
+    return { changed: false, skipped: true, reason: 'source_provider_section_missing' };
+  }
+
+  let nextText = targetText;
+  if (/^\s*model_provider\s*=.*$/m.test(nextText)) {
+    nextText = nextText.replace(/^\s*model_provider\s*=.*$/m, `model_provider = "${sourceProvider}"`);
+  } else {
+    nextText = `model_provider = "${sourceProvider}"\n${nextText}`;
+  }
+
+  const targetSectionPattern = new RegExp(
+    `^\\s*\\[model_providers\\.${escapeRegExp(sourceProvider)}\\]\\s*$([\\s\\S]*?)(?=^\\s*\\[[^\\]]+\\]\\s*$|$)`,
+    'm'
+  );
+  if (targetSectionPattern.test(nextText)) {
+    nextText = nextText.replace(targetSectionPattern, sourceSectionMatch[0].trimEnd());
+  } else {
+    nextText = `${nextText.trimEnd()}\n\n${sourceSectionMatch[0].trimEnd()}\n`;
+  }
+  nextText = nextText.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+
+  const changed = writeTextFileIfChanged(targetConfigPath, nextText);
+  return {
+    changed,
+    skipped: false,
+    reason: changed ? 'synced' : 'already_current',
+    sourceProvider,
+    targetConfigPath,
+  };
+}
+
+function syncCodexHomeAuth(configuredHome) {
+  const targetHome = normalizeString(configuredHome) ? path.resolve(configuredHome) : '';
+  if (!targetHome) return { changed: false, skipped: true, reason: 'home_missing' };
+
+  const defaultHome = path.join(os.homedir(), '.codex');
+  const sourceAuthPath = path.join(defaultHome, 'auth.json');
+  const targetAuthPath = path.join(targetHome, 'auth.json');
+  if (path.resolve(sourceAuthPath) === path.resolve(targetAuthPath)) {
+    return { changed: false, skipped: true, reason: 'same_auth' };
+  }
+
+  const sourceText = readTextFileIfExists(sourceAuthPath);
+  if (!sourceText) {
+    return { changed: false, skipped: true, reason: 'source_auth_missing' };
+  }
+
+  let sourceJson;
+  try {
+    sourceJson = JSON.parse(sourceText);
+  } catch (_) {
+    return { changed: false, skipped: true, reason: 'source_auth_invalid' };
+  }
+
+  if (!sourceJson || typeof sourceJson !== 'object' || Array.isArray(sourceJson)) {
+    return { changed: false, skipped: true, reason: 'source_auth_invalid' };
+  }
+
+  const sourceOpenaiApiKey = normalizeString(sourceJson.OPENAI_API_KEY);
+  const sourceTokens = sourceJson.tokens && typeof sourceJson.tokens === 'object' ? sourceJson.tokens : null;
+  if (!sourceOpenaiApiKey && !sourceTokens) {
+    return { changed: false, skipped: true, reason: 'source_auth_empty' };
+  }
+
+  let targetJson = {};
+  const targetText = readTextFileIfExists(targetAuthPath);
+  if (targetText) {
+    try {
+      const parsed = JSON.parse(targetText);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        targetJson = parsed;
+      }
+    } catch (_) {
+      targetJson = {};
+    }
+  }
+
+  const nextJson = { ...targetJson };
+  if (sourceOpenaiApiKey) nextJson.OPENAI_API_KEY = sourceOpenaiApiKey;
+  else delete nextJson.OPENAI_API_KEY;
+  if (sourceTokens) {
+    nextJson.tokens = sourceTokens;
+  }
+  if (sourceJson.auth_mode) {
+    nextJson.auth_mode = sourceJson.auth_mode;
+  }
+  if (sourceJson.last_refresh) {
+    nextJson.last_refresh = sourceJson.last_refresh;
+  }
+  if (sourceJson.auth_mode && sourceJson.auth_mode !== 'apikey') {
+    delete nextJson.OPENAI_API_KEY;
+  }
+
+  const nextText = `${JSON.stringify(nextJson, null, 2)}\n`;
+  const changed = writeTextFileIfChanged(targetAuthPath, nextText);
+  return {
+    changed,
+    skipped: false,
+    reason: changed ? 'synced' : 'already_current',
+    targetAuthPath,
+  };
+}
+
+function summarizeCodexExecFailure(err, codex = {}) {
+  const rawMessage = String(err?.message || '未知错误').trim();
+  const runtimeProvider = codex.runtimeProvider || deriveCodexRuntimeProvider(codex);
+  const providerLabel = runtimeProvider.providerName || runtimeProvider.provider || 'current';
+  const lines = [
+    `Codex 执行失败。当前配置：provider=${providerLabel}, model=${codex.model || '(default)'}, approval=${codex.approvalPolicy || '(default)'}, sandbox=${codex.sandbox || '(default)'}`,
+  ];
+  if (runtimeProvider.providerBaseUrl) {
+    lines.push(`provider_base_url=${runtimeProvider.providerBaseUrl}`);
+  }
+
+  const firstErrorLine = rawMessage
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => {
+      if (!line) return false;
+      const lower = line.toLowerCase();
+      if (lower.startsWith('openai codex v')) return false;
+      if (line === '--------') return false;
+      if (lower.startsWith('workdir:')) return false;
+      if (lower.startsWith('model:')) return false;
+      if (lower.startsWith('provider:')) return false;
+      if (lower.startsWith('approval:')) return false;
+      if (lower.startsWith('sandbox:')) return false;
+      if (lower.startsWith('reasoning effort:')) return false;
+      if (lower.startsWith('reasoning summaries:')) return false;
+      if (lower.startsWith('session id:')) return false;
+      if (lower === 'user') return false;
+      return true;
+    }) || '';
+
+  if (firstErrorLine) {
+    lines.push(`底层错误：${compactText(firstErrorLine, 600)}`);
+  } else if (rawMessage) {
+    lines.push(`底层错误：${compactText(rawMessage, 600)}`);
+  }
+  return compactText(lines.join('\n'), 1000);
+}
+
 function detectBinary(bin, versionArgs = ['-version']) {
   const raw = normalizeString(bin);
   if (!raw) return { found: false, version: '' };
@@ -100,16 +437,33 @@ function resolveCredentials(config = {}) {
 function resolveCodexConfig(config = {}) {
   const codex = asPlainObject(config.codex);
   const cwd = normalizeString(codex.cwd);
+  const home = normalizeString(codex.home);
+  const homeProviderSync = syncCodexHomeProviderConfig(home);
+  const homeAuthSync = syncCodexHomeAuth(home);
+  const cliLikeCodex = {
+    home,
+    api_key: normalizeString(codex.api_key),
+    apiKey: normalizeString(codex.api_key),
+  };
+  const selectedApiKey = selectCodexApiKey(cliLikeCodex);
   return {
     bin: normalizeString(codex.bin || 'codex') || 'codex',
     model: normalizeString(codex.model),
     reasoningEffort: normalizeString(codex.reasoning_effort),
     profile: normalizeString(codex.profile),
+    home,
     cwd,
     addDirs: normalizeStringList(codex.add_dirs).filter((dir) => dir !== cwd),
     historyTurns: asInt(codex.history_turns, 6, 0, 20),
-    systemPrompt: normalizeString(codex.system_prompt) || DEFAULT_CODEX_SYSTEM_PROMPT,
-    apiKey: normalizeString(codex.api_key),
+    systemPrompt: mergeTalkNormalPrompt(
+      normalizeString(codex.system_prompt),
+      DEFAULT_CODEX_SYSTEM_PROMPT
+    ),
+    apiKey: selectedApiKey.value,
+    apiKeySource: selectedApiKey.source,
+    runtimeProvider: selectedApiKey.runtimeProvider,
+    homeProviderSync,
+    homeAuthSync,
     sandbox: normalizeString(codex.sandbox || 'danger-full-access') || 'danger-full-access',
     approvalPolicy: normalizeString(codex.approval_policy || 'never') || 'never',
   };
@@ -179,6 +533,7 @@ function runCodexExec({
   model,
   reasoningEffort,
   profile,
+  home,
   cwd,
   addDirs = [],
   sandbox,
@@ -214,6 +569,8 @@ function runCodexExec({
     args.push('-');
 
     const childEnv = { ...process.env };
+    childEnv.HOME = process.env.HOME || os.homedir();
+    childEnv.CODEX_HOME = normalizeString(home) || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
     if (normalizeString(apiKey)) {
       childEnv.OPENAI_API_KEY = apiKey;
       childEnv.CODEX_API_KEY = apiKey;
@@ -425,6 +782,7 @@ function checkCodexEnvironment({ bin = 'codex', cwd = process.cwd(), apiKey = ''
   }
 
   const env = { ...process.env };
+  env.HOME = process.env.HOME || os.homedir();
   if (normalizeString(apiKey)) {
     env.OPENAI_API_KEY = apiKey;
     env.CODEX_API_KEY = apiKey;
@@ -506,6 +864,7 @@ module.exports = {
   compactText,
   createFeishuClient,
   detectBinary,
+  deriveCodexRuntimeProvider,
   ensure,
   generateCodexReply,
   normalizeString,
@@ -516,4 +875,5 @@ module.exports = {
   runCodexExec,
   sendCodexReplyPassthrough,
   splitTextForFeishu,
+  summarizeCodexExecFailure,
 };

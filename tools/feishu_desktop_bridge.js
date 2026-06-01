@@ -19,6 +19,7 @@ const {
   normalizeString: normalizeSupportString,
   resolveCodexConfig,
   resolveCredentials,
+  summarizeCodexExecFailure,
 } = require('./lib/studio_runtime_support');
 
 const REPO_DIR = path.resolve(__dirname, '..');
@@ -1026,12 +1027,12 @@ async function handleThreadSend(account) {
     const failedThread = normalizeThreadRecord({
       ...activeThread,
       status: 'error',
-      last_error: err.message,
+      last_error: summarizeCodexExecFailure(err, codex),
       updated_at: nowIso(),
     });
     store.threads[index] = failedThread;
     writeThreadStore(account, store.threads);
-    fail(err.message);
+    fail(summarizeCodexExecFailure(err, codex));
   }
 }
 

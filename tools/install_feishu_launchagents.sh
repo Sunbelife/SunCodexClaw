@@ -10,11 +10,17 @@ LOG_DIR="${RUNTIME_DIR}/logs"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PATH_VALUE="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
-CODEX_BIN="${CODEX_BIN:-$(command -v codex || true)}"
-CODEX_HOME_VALUE="${CODEX_HOME:-${HOME}/.codex}"
+DEFAULT_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+if [[ -z "${CODEX_BIN:-}" ]]; then
+  if [[ -x "${DEFAULT_CODEX_APP_BIN}" ]]; then
+    CODEX_BIN="${DEFAULT_CODEX_APP_BIN}"
+  else
+    CODEX_BIN="$(command -v codex || true)"
+  fi
+fi
+ZEROCHAT_API_KEY_VALUE="${ZEROCHAT_API_KEY:-}"
 OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
 CODEX_API_KEY_VALUE="${CODEX_API_KEY:-}"
-ZEROCHAT_API_KEY_VALUE="${ZEROCHAT_API_KEY:-}"
 NODE_TLS_REJECT_UNAUTHORIZED_VALUE="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
 LAUNCHCTL_PREFIX="${SUNCODEXCLAW_LAUNCHCTL_PREFIX:-com.sunbelife.suncodexclaw.feishu}"
 
@@ -97,9 +103,6 @@ write_plist() {
   if [[ -n "${CODEX_API_KEY_VALUE}" ]]; then
     env_exports="${env_exports} export CODEX_API_KEY=$(printf '%q' "${CODEX_API_KEY_VALUE}");"
   fi
-  if [[ -n "${CODEX_HOME_VALUE}" ]]; then
-    env_exports="${env_exports} export CODEX_HOME=$(printf '%q' "${CODEX_HOME_VALUE}");"
-  fi
   shell_cmd="export NODE_TLS_REJECT_UNAUTHORIZED=$(printf '%q' "${NODE_TLS_REJECT_UNAUTHORIZED_VALUE}"); export PATH=$(printf '%q' "${PATH_VALUE}");${env_exports} cd $(printf '%q' "${REPO_DIR}"); exec $(printf '%q' "${NODE_BIN}") $(printf '%q' "${BOT_SCRIPT}") --account $(printf '%q' "${account}")"
 
   cat > "${plist_path}" <<EOF
@@ -123,18 +126,16 @@ write_plist() {
     <string>$(xml_escape "${PATH_VALUE}")</string>
     <key>HOME</key>
     <string>$(xml_escape "${HOME}")</string>
-    <key>CODEX_HOME</key>
-    <string>$(xml_escape "${CODEX_HOME_VALUE}")</string>
     <key>NODE_TLS_REJECT_UNAUTHORIZED</key>
     <string>$(xml_escape "${NODE_TLS_REJECT_UNAUTHORIZED_VALUE}")</string>
     <key>FEISHU_CODEX_BIN</key>
     <string>$(xml_escape "${CODEX_BIN}")</string>
+    <key>ZEROCHAT_API_KEY</key>
+    <string>$(xml_escape "${ZEROCHAT_API_KEY_VALUE}")</string>
     <key>OPENAI_API_KEY</key>
     <string>$(xml_escape "${OPENAI_API_KEY_VALUE}")</string>
     <key>CODEX_API_KEY</key>
     <string>$(xml_escape "${CODEX_API_KEY_VALUE}")</string>
-    <key>ZEROCHAT_API_KEY</key>
-    <string>$(xml_escape "${ZEROCHAT_API_KEY_VALUE}")</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

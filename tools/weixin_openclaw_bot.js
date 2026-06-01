@@ -14,7 +14,12 @@ const {
   generateCodexReply,
   normalizeString,
   resolveCodexConfig,
+  summarizeCodexExecFailure,
 } = require('./lib/studio_runtime_support');
+const {
+  loadTalkNormalPromptMeta,
+  mergeTalkNormalPrompt,
+} = require('./lib/talk_normal_prompt');
 const {
   downloadWeixinAttachments,
   getMimeFromFilename,
@@ -160,10 +165,13 @@ function resolveLocalModelConfig(config) {
       0,
       20
     ),
-    systemPrompt: normalizeString(
-      process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_SYSTEM_PROMPT
-      || localModelRaw.system_prompt
-      || localModelRaw.systemPrompt
+    systemPrompt: mergeTalkNormalPrompt(
+      normalizeString(
+        process.env.WEIXIN_OPENCLAW_LOCAL_MODEL_SYSTEM_PROMPT
+        || localModelRaw.system_prompt
+        || localModelRaw.systemPrompt
+      ),
+      DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT
     ) || DEFAULT_LOCAL_MODEL_SYSTEM_PROMPT,
   };
 }
@@ -663,7 +671,9 @@ async function handleInboundMessage({
     upsertHistory(peerState, userText, historyReplyText, activeHistoryTurns);
     return true;
   } catch (err) {
-    const messageText = `处理失败：${compactText(err?.message || String(err), 240)}`;
+    const messageText = config.replyMode === 'local_model'
+      ? `处理失败：${compactText(err?.message || String(err), 240)}`
+      : summarizeCodexExecFailure(err, config.codex);
     await sendReplyChunks(config, userId, contextToken, messageText).catch(() => {});
     return false;
   } finally {
@@ -790,6 +800,7 @@ function printHelp() {
 }
 
 async function main() {
+  const talkNormalPrompt = loadTalkNormalPromptMeta();
   if (hasFlag('--help') || hasFlag('-h')) {
     printHelp();
     return;
@@ -810,6 +821,8 @@ async function main() {
   console.log(`weixin_base_url=${config.baseUrl}`);
   console.log(`weixin_token_found=${config.token ? 'true' : 'false'}`);
   console.log(`codex_cwd=${config.codex.cwd || process.cwd()}`);
+  console.log(`talk_normal_prompt_loaded=${talkNormalPrompt.loaded ? 'true' : 'false'}`);
+  if (talkNormalPrompt.loaded) console.log(`talk_normal_prompt_path=${talkNormalPrompt.path}`);
 
   if (hasFlag('--login')) {
     await runLoginFlow(accountName, config);

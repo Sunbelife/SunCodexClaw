@@ -62,6 +62,17 @@ append_export_if_set() {
   fi
 }
 
+append_export_alias_if_set() {
+  local __outvar="$1"
+  local source_key="$2"
+  local target_key="$3"
+  local value="${!source_key-}"
+  [[ -n "${__outvar}" && -n "${source_key}" && -n "${target_key}" ]] || return 0
+  if [[ -n "${value}" ]]; then
+    printf -v "${__outvar}" '%s export %s=%q;' "${!__outvar-}" "${target_key}" "${value}"
+  fi
+}
+
 yaml_config_names() {
   [[ -f "${REPO_DIR}/tools/lib/local_secret_store.js" ]] || return 0
   REPO_DIR_ENV="${REPO_DIR}" "${NODE_BIN_RESOLVED}" - <<'EOF' 2>/dev/null || true
@@ -242,10 +253,6 @@ start_one_launchctl() {
     bootstrap_launchctl_plist "${account}"
   else
     env_exports=''
-    append_export_if_set env_exports ZEROCHAT_API_KEY
-    append_export_if_set env_exports OPENAI_API_KEY
-    append_export_if_set env_exports CODEX_API_KEY
-    append_export_if_set env_exports CODEX_HOME
 
     printf -v cmd 'export PATH=%q;%s cd %q; exec %q %q --account %q >> %q 2>&1' \
       "${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}" \
@@ -339,7 +346,7 @@ find_manual_pids() {
 
 start_one() {
   local account="$1"
-  local pidf logf pid cfg manual
+  local pidf logf pid cfg manual env_exports
   pidf="$(pid_file "${account}")"
   logf="$(log_file "${account}")"
   cfg="${CONFIG_DIR}/${account}.json"
@@ -382,13 +389,15 @@ start_one() {
     echo "[$(date '+%F %T')] starting account=${account}"
   } >> "${logf}"
 
-  ZEROCHAT_API_KEY="${ZEROCHAT_API_KEY-}" \
-  OPENAI_API_KEY="${OPENAI_API_KEY-}" \
-  CODEX_API_KEY="${CODEX_API_KEY-}" \
-  CODEX_HOME="${CODEX_HOME-}" \
-  nohup "${NODE_BIN}" "${BOT_SCRIPT}" --account "${account}" >> "${logf}" 2>&1 &
-  pid="$!"
-  echo "${pid}" > "${pidf}"
+  env_exports=''
+  append_export_if_set env_exports ZEROCHAT_API_KEY
+  append_export_if_set env_exports OPENAI_API_KEY
+  append_export_if_set env_exports CODEX_API_KEY
+  append_export_if_set env_exports FEISHU_CODEX_BIN
+  append_export_if_set env_exports NODE_TLS_REJECT_UNAUTHORIZED
+
+  /bin/zsh -lc "${env_exports} cd ${REPO_DIR:q}; nohup ${NODE_BIN_RESOLVED:q} ${BOT_SCRIPT:q} --account ${account:q} >> ${logf:q} 2>&1 & echo \$!" > "${pidf}"
+  pid="$(cat "${pidf}" 2>/dev/null || true)"
   sleep 1
 
   if is_bot_pid_for_account "${pid}" "${account}"; then
@@ -468,6 +477,19 @@ status_one() {
       pid="$(launchctl_job_pid "${account}" || true)"
       rm -f "${pidf}"
       echo "[running] ${account} pid=${pid} manager=${manager} log=${logf}"
+      return 0
+    fi
+    if [[ -f "${pidf}" ]]; then
+      pid="$(cat "${pidf}" 2>/dev/null || true)"
+      if is_bot_pid_for_account "${pid}" "${account}"; then
+        echo "[running] ${account} pid=${pid} manager=pidfile log=${logf}"
+        return 0
+      fi
+    fi
+    manual="$(find_manual_pids "${account}" | head -n 1)"
+    if is_bot_pid_for_account "${manual}" "${account}"; then
+      echo "${manual}" > "${pidf}"
+      echo "[running] ${account} pid=${manual} manager=manual log=${logf}"
       return 0
     fi
     if launchctl_job_exists "${account}"; then
