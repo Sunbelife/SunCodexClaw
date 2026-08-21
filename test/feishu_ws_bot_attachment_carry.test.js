@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { Readable } = require('node:stream');
 
 const {
   FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS,
@@ -8,6 +9,8 @@ const {
   buildDispatchEnvelope,
   extractAttachmentBundleFromMessageItem,
   findRecentAttachmentBundleFromMessageItems,
+  normalizeFeishuResourceDownloadError,
+  resolveLiveRecentAttachmentBundle,
   selectAttachmentSource,
 } = require('../tools/feishu_ws_bot.js').__test__;
 
@@ -366,6 +369,40 @@ test('quoted attachment is preferred over recent attachment carry', () => {
     selection.bundle.fileItems.map((item) => item.fileKey),
     ['filek-quoted']
   );
+});
+
+test('captured recent attachment is ignored after its live carry is consumed', () => {
+  const capturedBundle = buildAttachmentBundle({
+    messageType: 'file',
+    messageID: 'file-1',
+    timestamp: 1_000,
+    fileItems: [{ messageID: 'file-1', fileKey: 'filek-1', fileName: 'report.zip' }],
+  });
+
+  assert.deepEqual(
+    resolveLiveRecentAttachmentBundle(capturedBundle, capturedBundle)?.sourceMessageIDs,
+    ['file-1']
+  );
+  assert.equal(resolveLiveRecentAttachmentBundle(capturedBundle, null), null);
+});
+
+test('Feishu oversized resource errors are normalized from streamed API bodies', async () => {
+  const original = new Error('Request failed with status code 400');
+  original.response = {
+    status: 400,
+    data: Readable.from([
+      JSON.stringify({
+        code: 234037,
+        msg: 'Downloaded file size exceeds limit.',
+      }),
+    ]),
+  };
+
+  const normalized = await normalizeFeishuResourceDownloadError(original);
+
+  assert.equal(normalized.feishuApiCode, '234037');
+  assert.equal(normalized.feishuResourceFailure, 'file_size_exceeds_limit');
+  assert.match(normalized.message, /Downloaded file size exceeds limit/);
 });
 
 test('history fallback can recover a missed file event from recent chat messages', () => {

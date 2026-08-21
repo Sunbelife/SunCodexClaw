@@ -10,7 +10,7 @@ LOG_DIR="${RUNTIME_DIR}/logs"
 PLIST_DIR="${HOME}/Library/LaunchAgents"
 PATH_VALUE="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
-DEFAULT_CODEX_APP_BIN="/Applications/Codex.app/Contents/Resources/codex"
+DEFAULT_CODEX_APP_BIN="/Applications/ChatGPT.app/Contents/Resources/codex"
 if [[ -z "${CODEX_BIN:-}" ]]; then
   if [[ -x "${DEFAULT_CODEX_APP_BIN}" ]]; then
     CODEX_BIN="${DEFAULT_CODEX_APP_BIN}"
@@ -21,6 +21,14 @@ fi
 ZEROCHAT_API_KEY_VALUE="${ZEROCHAT_API_KEY:-}"
 OPENAI_API_KEY_VALUE="${OPENAI_API_KEY:-}"
 CODEX_API_KEY_VALUE="${CODEX_API_KEY:-}"
+FEISHU_SPEECH_PROVIDER_VALUE="${FEISHU_SPEECH_PROVIDER:-}"
+FEISHU_SPEECH_API_KEY_VALUE="${FEISHU_SPEECH_API_KEY:-}"
+FEISHU_SPEECH_TRANSCRIPTION_URL_VALUE="${FEISHU_SPEECH_TRANSCRIPTION_URL:-}"
+FEISHU_SPEECH_AUTH_HEADER_VALUE="${FEISHU_SPEECH_AUTH_HEADER:-}"
+FEISHU_SPEECH_AUTH_TOKEN_VALUE="${FEISHU_SPEECH_AUTH_TOKEN:-}"
+FEISHU_SPEECH_BASE_URL_VALUE="${FEISHU_SPEECH_BASE_URL:-}"
+FEISHU_SPEECH_MODEL_VALUE="${FEISHU_SPEECH_MODEL:-}"
+FEISHU_SPEECH_LANGUAGE_VALUE="${FEISHU_SPEECH_LANGUAGE:-}"
 NODE_TLS_REJECT_UNAUTHORIZED_VALUE="${NODE_TLS_REJECT_UNAUTHORIZED:-0}"
 LAUNCHCTL_PREFIX="${SUNCODEXCLAW_LAUNCHCTL_PREFIX:-com.sunbelife.suncodexclaw.feishu}"
 
@@ -103,6 +111,30 @@ write_plist() {
   if [[ -n "${CODEX_API_KEY_VALUE}" ]]; then
     env_exports="${env_exports} export CODEX_API_KEY=$(printf '%q' "${CODEX_API_KEY_VALUE}");"
   fi
+  if [[ -n "${FEISHU_SPEECH_PROVIDER_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_PROVIDER=$(printf '%q' "${FEISHU_SPEECH_PROVIDER_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_API_KEY_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_API_KEY=$(printf '%q' "${FEISHU_SPEECH_API_KEY_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_TRANSCRIPTION_URL_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_TRANSCRIPTION_URL=$(printf '%q' "${FEISHU_SPEECH_TRANSCRIPTION_URL_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_AUTH_HEADER_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_AUTH_HEADER=$(printf '%q' "${FEISHU_SPEECH_AUTH_HEADER_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_AUTH_TOKEN_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_AUTH_TOKEN=$(printf '%q' "${FEISHU_SPEECH_AUTH_TOKEN_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_BASE_URL_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_BASE_URL=$(printf '%q' "${FEISHU_SPEECH_BASE_URL_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_MODEL_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_MODEL=$(printf '%q' "${FEISHU_SPEECH_MODEL_VALUE}");"
+  fi
+  if [[ -n "${FEISHU_SPEECH_LANGUAGE_VALUE}" ]]; then
+    env_exports="${env_exports} export FEISHU_SPEECH_LANGUAGE=$(printf '%q' "${FEISHU_SPEECH_LANGUAGE_VALUE}");"
+  fi
   shell_cmd="export NODE_TLS_REJECT_UNAUTHORIZED=$(printf '%q' "${NODE_TLS_REJECT_UNAUTHORIZED_VALUE}"); export PATH=$(printf '%q' "${PATH_VALUE}");${env_exports} cd $(printf '%q' "${REPO_DIR}"); exec $(printf '%q' "${NODE_BIN}") $(printf '%q' "${BOT_SCRIPT}") --account $(printf '%q' "${account}")"
 
   cat > "${plist_path}" <<EOF
@@ -136,6 +168,22 @@ write_plist() {
     <string>$(xml_escape "${OPENAI_API_KEY_VALUE}")</string>
     <key>CODEX_API_KEY</key>
     <string>$(xml_escape "${CODEX_API_KEY_VALUE}")</string>
+    <key>FEISHU_SPEECH_PROVIDER</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_PROVIDER_VALUE}")</string>
+    <key>FEISHU_SPEECH_API_KEY</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_API_KEY_VALUE}")</string>
+    <key>FEISHU_SPEECH_TRANSCRIPTION_URL</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_TRANSCRIPTION_URL_VALUE}")</string>
+    <key>FEISHU_SPEECH_AUTH_HEADER</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_AUTH_HEADER_VALUE}")</string>
+    <key>FEISHU_SPEECH_AUTH_TOKEN</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_AUTH_TOKEN_VALUE}")</string>
+    <key>FEISHU_SPEECH_BASE_URL</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_BASE_URL_VALUE}")</string>
+    <key>FEISHU_SPEECH_MODEL</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_MODEL_VALUE}")</string>
+    <key>FEISHU_SPEECH_LANGUAGE</key>
+    <string>$(xml_escape "${FEISHU_SPEECH_LANGUAGE_VALUE}")</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

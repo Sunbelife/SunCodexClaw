@@ -21,6 +21,12 @@ const {
   resolveCredentials,
   summarizeCodexExecFailure,
 } = require('./lib/studio_runtime_support');
+const {
+  buildAgentGatewayCodexHint,
+  classifyAgentGatewayRequest,
+  resolveAgentGatewayConfig,
+  summarizeAgentGatewayRoute,
+} = require('./lib/agent_gateway');
 
 const REPO_DIR = path.resolve(__dirname, '..');
 const CONFIG_DIR = path.join(REPO_DIR, 'config', 'feishu');
@@ -121,6 +127,65 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function normalizeHistoryRole(role) {
+  const value = normalizeString(role || 'user');
+  if (['user', 'assistant', 'progress', 'error', 'system'].includes(value)) return value;
+  return 'assistant';
+}
+
+function summarizeStudioCodexEvent(event = {}) {
+  if (!event || typeof event !== 'object') return '';
+  const type = normalizeString(event.type);
+  const item = event.item && typeof event.item === 'object' ? event.item : {};
+  const itemType = normalizeString(item.type || event.item_type || event.itemType);
+
+  if (type === 'thread.started') {
+    return `启动 Codex 线程：${compactText(event.thread_id || '', 48) || '(new)'}`;
+  }
+  if (type === 'turn.started') return '开始执行任务';
+  if (type === 'turn.completed') return '执行完成，正在整理最终回复';
+  if (type === 'turn.failed') {
+    return `执行失败：${compactText(event.error?.message || event.message || '', 220) || '未知错误'}`;
+  }
+
+  if (type === 'agent_message' && event.text) {
+    const phase = normalizeString(event.phase).toLowerCase();
+    if (phase && phase !== 'commentary') return '';
+    return compactText(event.text, 320);
+  }
+
+  if ((type === 'item.completed' || type === 'item.started') && itemType === 'agent_message' && item.text) {
+    const phase = normalizeString(item.phase || event.phase).toLowerCase();
+    if (phase && phase !== 'commentary') return '';
+    return compactText(item.text, 320);
+  }
+
+  if (itemType === 'reasoning') return '';
+
+  const verb = type === 'item.completed' ? '完成' : type === 'item.started' ? '开始' : '';
+  if (itemType === 'command_execution' || itemType === 'shell_command' || itemType === 'exec_command') {
+    const command = item.command || item.cmd || item.argv?.join?.(' ') || '';
+    const exitCode = item.exit_code ?? item.exitCode;
+    return [
+      `${verb || '运行'}命令`,
+      command ? `：${compactText(command, 180)}` : '',
+      exitCode !== undefined && exitCode !== null ? `（exit=${exitCode}）` : '',
+    ].join('');
+  }
+
+  if (itemType.includes('mcp') || itemType.includes('tool')) {
+    const server = normalizeString(item.server || item.server_name || item.mcp_server || event.server);
+    const tool = normalizeString(item.tool || item.tool_name || item.name || event.tool);
+    return `${verb || '调用'}工具：${[server, tool].filter(Boolean).join('/') || compactText(itemType, 80)}`;
+  }
+
+  if (itemType === 'file_change' || itemType === 'patch') {
+    return `${verb || '处理'}文件变更：${compactText(item.path || item.file || '', 140) || '未标明路径'}`;
+  }
+
+  return '';
+}
+
 function normalizeThreadRecord(thread) {
   const value = ensurePlainObject(thread);
   return {
@@ -138,8 +203,9 @@ function normalizeThreadRecord(thread) {
     history: Array.isArray(value.history)
       ? value.history
         .map((item) => ({
-          role: normalizeString(item?.role || 'user') || 'user',
+          role: normalizeHistoryRole(item?.role || 'user'),
           text: normalizeString(item?.text),
+          at: normalizeString(item?.at || item?.created_at || item?.createdAt),
         }))
         .filter((item) => item.text)
       : [],
@@ -635,8 +701,9 @@ function splitConfigForSave(profile) {
     },
     codex: {
       bin: normalizeString(codex.bin || 'codex'),
-      model: normalizeString(codex.model || 'gpt-5.4'),
+      model: normalizeString(codex.model || 'gpt-5.6-sol'),
       reasoning_effort: normalizeString(codex.reasoning_effort || 'xhigh'),
+      service_tier: normalizeString(codex.service_tier || codex.serviceTier || 'default'),
       profile: normalizeString(codex.profile || ''),
       cwd: normalizeString(codex.cwd || ''),
       add_dirs: normalizeStringList(codex.add_dirs),
@@ -705,8 +772,9 @@ function sanitizeForEditor(merged) {
     codex: {
       bin: normalizeString(codex.bin || 'codex'),
       api_key: normalizeString(codex.api_key),
-      model: normalizeString(codex.model || 'gpt-5.4'),
+      model: normalizeString(codex.model || 'gpt-5.6-sol'),
       reasoning_effort: normalizeString(codex.reasoning_effort || 'xhigh'),
+      service_tier: normalizeString(codex.service_tier || codex.serviceTier || 'default'),
       profile: normalizeString(codex.profile),
       cwd: normalizeString(codex.cwd),
       add_dirs: normalizeStringList(codex.add_dirs),
@@ -959,39 +1027,82 @@ async function handleThreadSend(account) {
   const payload = ensurePlainObject(readPayload());
   const threadId = sanitizeThreadId(payload.thread_id || payload.threadId);
   const text = normalizeString(payload.text);
+  const deliveryMode = normalizeString(payload.deliver || payload.delivery || payload.deliveryMode || 'feishu').toLowerCase();
+  const shouldDeliverToFeishu = !['dashboard', 'local', 'none', 'return_only', 'return-only'].includes(deliveryMode);
   if (!threadId) fail('thread_id is required');
   if (!text) fail('text is required');
 
   const { store, index, thread } = findThreadOrFail(account, threadId);
   const merged = mergedConfigForAccount(account).merged;
-  const creds = resolveCredentials(merged);
   const codex = resolveCodexConfig(merged);
   const chatId = normalizeString(thread.chatId);
-  if (!chatId) fail('thread chat_id is required');
+  if (shouldDeliverToFeishu && !chatId) fail('thread chat_id is required');
   if (!normalizeString(codex.cwd)) fail('codex.cwd is required');
+  const agentGateway = resolveAgentGatewayConfig(merged);
+  const agentGatewayRoute = classifyAgentGatewayRequest(text, agentGateway);
+  const agentGatewayHint = buildAgentGatewayCodexHint(agentGatewayRoute, agentGateway);
 
-  const activeThread = normalizeThreadRecord({
+  const promptHistory = (thread.history || [])
+    .filter((item) => item.role === 'user' || item.role === 'assistant')
+    .map((item) => ({ role: item.role, text: item.text }));
+  let liveHistory = [
+    ...(thread.history || []),
+    { role: 'user', text, at: nowIso() },
+    { role: 'progress', text: `路由：${summarizeAgentGatewayRoute(agentGatewayRoute)}`, at: nowIso() },
+    { role: 'progress', text: '已交给该机器人的 Codex 线程执行', at: nowIso() },
+  ];
+  let liveThread = normalizeThreadRecord({
     ...thread,
+    history: liveHistory,
     status: 'running',
     last_error: '',
     updated_at: nowIso(),
   });
-  store.threads[index] = activeThread;
-  writeThreadStore(account, store.threads);
+
+  function writeLiveThread(extra = {}) {
+    liveThread = normalizeThreadRecord({
+      ...liveThread,
+      ...extra,
+      history: liveHistory,
+      updated_at: nowIso(),
+    });
+    store.threads[index] = liveThread;
+    writeThreadStore(account, store.threads);
+  }
+
+  let progressCount = 0;
+  let lastProgressText = '';
+  function appendProgress(rawText) {
+    const progressText = normalizeString(rawText);
+    if (!progressText || progressText === lastProgressText) return;
+    if (progressCount >= 80) return;
+    progressCount += 1;
+    lastProgressText = progressText;
+    liveHistory.push({
+      role: 'progress',
+      text: progressText,
+      at: nowIso(),
+    });
+    writeLiveThread({ status: 'running', last_error: '' });
+  }
+
+  function trimLiveHistory(maxItems = 80) {
+    while (liveHistory.length > maxItems) liveHistory.shift();
+  }
+
+  writeLiveThread();
 
   try {
-    const client = createFeishuClient({
-      domain: normalizeString(merged.domain || 'feishu') || 'feishu',
-      creds,
-    });
     const reply = await generateCodexReply({
       codex,
-      history: activeThread.history,
+      history: promptHistory,
       userText: text,
-      sessionId: activeThread.codexThreadId,
+      sessionId: liveThread.codexThreadId,
+      agentGatewayHint,
+      onProgressEvent: (event) => appendProgress(summarizeStudioCodexEvent(event)),
       threadTitle: buildStudioThreadTitle({
         account: normalizeString(merged.bot_name || account),
-        threadName: activeThread.name,
+        threadName: liveThread.name,
         userText: text,
       }),
     });
@@ -999,19 +1110,23 @@ async function handleThreadSend(account) {
     if (!replyText) {
       throw new Error('codex returned empty reply');
     }
-    const sentChunks = await sendCodexReplyPassthrough(client, chatId, replyText);
+    let sentChunks = 0;
+    if (shouldDeliverToFeishu) {
+      const creds = resolveCredentials(merged);
+      const client = createFeishuClient({
+        domain: normalizeString(merged.domain || 'feishu') || 'feishu',
+        creds,
+      });
+      sentChunks = await sendCodexReplyPassthrough(client, chatId, replyText);
+    }
 
-    const nextHistory = [
-      ...(activeThread.history || []),
-      { role: 'user', text },
-      { role: 'assistant', text: compactText(replyText, 4000) },
-    ];
-    const maxItems = Math.max(0, Number(codex.historyTurns || 0)) * 2;
-    while (maxItems > 0 && nextHistory.length > maxItems) nextHistory.shift();
+    liveHistory.push({ role: 'assistant', text: compactText(replyText, 4000), at: nowIso() });
+    const maxItems = Math.max(12, Number(codex.historyTurns || 0) * 6 || 36);
+    trimLiveHistory(maxItems);
     const completedThread = normalizeThreadRecord({
-      ...activeThread,
-      history: maxItems === 0 ? [] : nextHistory,
-      codex_thread_id: normalizeString(reply.threadId || activeThread.codexThreadId),
+      ...liveThread,
+      history: liveHistory,
+      codex_thread_id: normalizeString(reply.threadId || liveThread.codexThreadId),
       status: 'idle',
       last_reply_preview: compactText(replyText, 160),
       updated_at: nowIso(),
@@ -1020,12 +1135,23 @@ async function handleThreadSend(account) {
     writeThreadStore(account, store.threads);
     jsonOut({
       ...buildThreadEnvelope(account, completedThread),
+      deliver: shouldDeliverToFeishu ? 'feishu' : 'dashboard',
       sentChunks,
+      reply: replyText,
       preview: completedThread.lastReplyPreview,
+      agentGatewayRoute,
+      agentGatewayRouteSummary: summarizeAgentGatewayRoute(agentGatewayRoute),
     });
   } catch (err) {
+    liveHistory.push({
+      role: 'error',
+      text: summarizeCodexExecFailure(err, codex),
+      at: nowIso(),
+    });
+    trimLiveHistory();
     const failedThread = normalizeThreadRecord({
-      ...activeThread,
+      ...liveThread,
+      history: liveHistory,
       status: 'error',
       last_error: summarizeCodexExecFailure(err, codex),
       updated_at: nowIso(),

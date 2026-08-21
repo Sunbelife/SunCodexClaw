@@ -4,7 +4,7 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
-const { randomBytes } = require('crypto');
+const { createHash, randomBytes } = require('crypto');
 const WebSocket = require('ws');
 const {
   deepMerge,
@@ -26,6 +26,12 @@ const {
   loadTalkNormalPromptMeta,
   mergeTalkNormalPrompt,
 } = require('./lib/talk_normal_prompt');
+const {
+  buildAgentGatewayCodexHint,
+  classifyAgentGatewayRequest,
+  resolveAgentGatewayConfig,
+  summarizeAgentGatewayRoute,
+} = require('./lib/agent_gateway');
 
 let lark = null;
 try {
@@ -64,6 +70,16 @@ const FORCE_EXECUTE_CODE_TASK_PROMPT = [
   '默认先查看代码并直接动手实现，不要只给方案，不要只口头答应。',
   '优先完成文件修改、命令执行和必要验证，再回复结果。',
   '回复时简洁说明改了什么、验证了什么、还剩什么风险。',
+].join('\n');
+const CODEX_EXECUTION_GUARDRAIL_PROMPT = [
+  '飞书执行规则：',
+  '当用户要求你做、改、查、看文件、排查、部署、读取日志、处理配置或完成工程任务时，不要只回复“好的/收到/可以”。',
+  '必须实际使用可用工具或命令推进；能完成就给完成结果和验证，不能完成就说明具体阻塞原因。',
+].join('\n');
+const CODEX_EXECUTION_RETRY_PROMPT = [
+  '执行验收提醒：上一次输出像是简短确认，且没有观察到命令或工具步骤。',
+  '请现在实际执行用户任务；不要再只回复“好的/收到/可以”。',
+  '如果确实无法执行，请明确写出阻塞原因和下一步。',
 ].join('\n');
 const MAX_IMAGE_INPUTS = 6;
 const FEISHU_TEXT_CHUNK_LIMIT = 4000;
@@ -187,14 +203,20 @@ const CONTENT_TYPE_EXTENSION_MAP = new Map([
   ['audio/opus', '.opus'],
   ['application/ogg', '.ogg'],
 ]);
+const FEISHU_FILE_RESOURCE_KEY_PREFIX_RE = /^(?:file|file_v\d*)_/i;
 const REPO_DIR = path.resolve(__dirname, '..');
 const FEISHU_RUNTIME_DIR = path.join(REPO_DIR, '.runtime', 'feishu');
 const FEISHU_LOG_DIR = path.join(FEISHU_RUNTIME_DIR, 'logs');
 const FEISHU_MEMORY_DIR = path.join(FEISHU_RUNTIME_DIR, 'memory');
 const FEISHU_APPROVAL_DIR = path.join(FEISHU_RUNTIME_DIR, 'approvals');
-const FEISHU_CODEX_EXEC_LOCK_DIR = path.join(FEISHU_RUNTIME_DIR, 'codex-exec.lock');
+const FEISHU_CODEX_EXEC_LOCK_ROOT_DIR = path.join(FEISHU_RUNTIME_DIR, 'codex-exec-locks');
+const FEISHU_MODEL_OVERRIDE_DIR = path.join(FEISHU_RUNTIME_DIR, 'model_overrides');
+const FEISHU_CHAT_RECORDS_DIR = path.join(REPO_DIR, 'Chatlog');
 const FEISHU_WORKSPACE_ROOT = path.join(os.homedir(), 'Downloads', 'SunCodexClaw', 'feishu');
 const FEISHU_INCOMING_ATTACHMENT_DIR = FEISHU_WORKSPACE_ROOT;
+const DEFAULT_CODEX_MODEL = 'gpt-5.6-sol';
+const DEFAULT_CODEX_REASONING_EFFORT = 'xhigh';
+const DEFAULT_CODEX_SERVICE_TIER = 'default';
 const FEISHU_MEMORY_HEADER = '<<SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_FOOTER = '<<END_SUNCODEXCLAW_MEMORY_BUNDLE_V1>>';
 const FEISHU_MEMORY_SCOPE_PROFILE = 'profile_facts';
@@ -247,6 +269,269 @@ function readLogTail(filePath, lineLimit = 240) {
   const raw = fs.readFileSync(filePath, 'utf8');
   const lines = raw.split(/\r?\n/).filter((line) => line.length > 0);
   return lines.slice(-Math.max(1, Number(lineLimit) || 1));
+}
+
+function formatLocalDateFolder(date = new Date()) {
+  const d = date instanceof Date ? date : new Date(date);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function safeChatRecordPathSegment(rawText = '') {
+  const text = String(rawText || '')
+    .trim()
+    .replace(/[\/\\:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/\s+/g, ' ')
+    .replace(/^\.+$/g, '_')
+    .slice(0, 80);
+  return text || 'unknown';
+}
+
+function resolveChatRecordPath({ botName = '', accountName = '', date = new Date() } = {}) {
+  const botSegment = safeChatRecordPathSegment(botName || accountName || 'unknown-bot');
+  const dateSegment = formatLocalDateFolder(date);
+  return path.join(FEISHU_CHAT_RECORDS_DIR, botSegment, dateSegment, 'chat.jsonl');
+}
+
+function appendChatRecord({
+  botName = '',
+  accountName = '',
+  record = {},
+  date = new Date(),
+} = {}) {
+  try {
+    const filePath = resolveChatRecordPath({ botName, accountName, date });
+    ensureDirSync(path.dirname(filePath));
+    const payload = {
+      ts: new Date(date).toISOString(),
+      account: accountName || '',
+      bot_name: botName || accountName || '',
+      ...record,
+    };
+    fs.appendFileSync(filePath, `${JSON.stringify(payload)}\n`, 'utf8');
+    return filePath;
+  } catch (err) {
+    console.error(`chat_record=error message=${err.message}`);
+    return '';
+  }
+}
+
+function codexModelOverridePath(accountName = '') {
+  return path.join(FEISHU_MODEL_OVERRIDE_DIR, `${safeChatRecordPathSegment(accountName || 'default')}.json`);
+}
+
+function normalizeCodexModelName(value = '') {
+  const text = normalizeString(value);
+  if (!text) return '';
+  const compact = text.toLowerCase().replace(/\s+/g, '');
+  if (/^gpt-5\.6-terra$/i.test(text) || compact.includes('terra')) return 'gpt-5.6-terra';
+  if (/^gpt-5\.6-sol$/i.test(text) || compact.includes('sol')) return 'gpt-5.6-sol';
+  if (/^gpt-5\.[0-9a-z.-]+$/i.test(text)) return text;
+  if (compact.includes('5.6') || compact.includes('56')) return 'gpt-5.6-sol';
+  if (compact.includes('5.5') || compact.includes('55')) return 'gpt-5.5';
+  if (compact.includes('5.4') || compact.includes('54')) return 'gpt-5.4';
+  return '';
+}
+
+function normalizeCodexReasoningEffort(value = '') {
+  const text = normalizeString(value).toLowerCase();
+  if (!text) return '';
+  if (/(ultra|xhigh|extra[-_\s]?high|最高|超高|极高|拉满)/i.test(text)) return 'xhigh';
+  if (/(high|高强度|高推理|强推理|深度|认真想)/i.test(text)) return 'high';
+  if (/(medium|中等|标准|普通|正常)/i.test(text)) return 'medium';
+  if (/(low|light|轻度|轻推理|低|省|快一点|简单想)/i.test(text)) return 'low';
+  if (/(minimal|最低|最省)/i.test(text)) return 'minimal';
+  return '';
+}
+
+function normalizeCodexServiceTier(value = '') {
+  const text = normalizeString(value).toLowerCase();
+  if (!text) return '';
+  if (/(priority|prioritized|fast|high|高速|高速度|快档|加速|优先|快一点|跑快)/i.test(text)) return 'priority';
+  if (/(default|standard|auto|normal|普通|标准|默认|正常|省钱)/i.test(text)) return 'default';
+  return '';
+}
+
+function normalizeCodexModelSelection(raw = {}) {
+  const input = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    model: normalizeCodexModelName(input.model || input.codex_model || input.codexModel || ''),
+    reasoningEffort: normalizeCodexReasoningEffort(
+      input.reasoning_effort || input.reasoningEffort || input.effort || ''
+    ),
+    serviceTier: normalizeCodexServiceTier(
+      input.service_tier || input.serviceTier || input.speed || input.tier || ''
+    ),
+    updatedAt: asInt(input.updated_at || input.updatedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    updatedBy: normalizeString(input.updated_by || input.updatedBy),
+    sourceText: normalizeString(input.source_text || input.sourceText),
+  };
+}
+
+function readCodexModelOverride(accountName = '') {
+  const filePath = codexModelOverridePath(accountName);
+  if (!fs.existsSync(filePath)) return {};
+  return {
+    ...normalizeCodexModelSelection(readJsonIfExists(filePath) || {}),
+    exists: true,
+  };
+}
+
+function writeCodexModelOverride(accountName = '', selection = {}) {
+  const normalized = normalizeCodexModelSelection(selection);
+  writeJsonPretty(codexModelOverridePath(accountName), {
+    model: normalized.model,
+    reasoning_effort: normalized.reasoningEffort,
+    service_tier: normalized.serviceTier,
+    updated_at: normalized.updatedAt || Date.now(),
+    updated_by: normalized.updatedBy,
+    source_text: normalized.sourceText,
+  });
+  return normalized;
+}
+
+function applyCodexModelSelection(codex = {}, selection = {}) {
+  const normalized = normalizeCodexModelSelection(selection);
+  if (normalized.model) codex.model = normalized.model;
+  if (normalized.reasoningEffort) codex.reasoningEffort = normalized.reasoningEffort;
+  const hasServiceTier = Object.prototype.hasOwnProperty.call(selection || {}, 'serviceTier')
+    || Object.prototype.hasOwnProperty.call(selection || {}, 'service_tier')
+    || Object.prototype.hasOwnProperty.call(selection || {}, 'speed')
+    || Object.prototype.hasOwnProperty.call(selection || {}, 'tier');
+  if (hasServiceTier) {
+    codex.serviceTier = normalized.serviceTier;
+  } else if (normalized.serviceTier) {
+    codex.serviceTier = normalized.serviceTier;
+  }
+  return codex;
+}
+
+function formatCodexReasoningEffort(value = '') {
+  const effort = normalizeString(value) || '(default)';
+  if (effort === 'xhigh') return 'ultra/xhigh';
+  if (effort === 'high') return 'high';
+  if (effort === 'medium') return 'medium';
+  if (effort === 'low') return 'light/low';
+  if (effort === 'minimal') return 'minimal';
+  return effort;
+}
+
+function formatCodexServiceTier(value = '') {
+  const tier = normalizeString(value);
+  if (!tier) return 'standard/default';
+  if (tier === 'priority') return 'high/priority';
+  if (tier === 'default') return 'standard/default';
+  return tier;
+}
+
+function buildCodexModelStatus(codexOrStatus = {}) {
+  const source = codexOrStatus && typeof codexOrStatus === 'object' ? codexOrStatus : {};
+  const model = normalizeString(source.model) || DEFAULT_CODEX_MODEL;
+  const reasoningEffort = normalizeString(source.reasoningEffort || source.reasoning_effort)
+    || DEFAULT_CODEX_REASONING_EFFORT;
+  const hasServiceTier = Object.prototype.hasOwnProperty.call(source, 'serviceTier')
+    || Object.prototype.hasOwnProperty.call(source, 'service_tier');
+  const serviceTier = hasServiceTier
+    ? normalizeString(source.serviceTier || source.service_tier)
+    : DEFAULT_CODEX_SERVICE_TIER;
+  return {
+    model,
+    reasoningEffort,
+    serviceTier,
+    line: `当前模型：${model}｜强度：${formatCodexReasoningEffort(reasoningEffort)}｜速度：${formatCodexServiceTier(serviceTier)}`,
+  };
+}
+
+function appendCodexModelStatusFooter(text = '', codexOrStatus = {}, enabled = true) {
+  const body = String(text || '').replace(/\r/g, '').trimEnd();
+  if (!body || enabled === false) return body;
+  const status = buildCodexModelStatus(codexOrStatus);
+  if (body.includes(status.line) || /当前模型：/.test(body.slice(-240))) return body;
+  return `${body}\n\n${status.line}`;
+}
+
+function parseCodexModelCommand(rawText = '') {
+  const text = normalizeString(rawText);
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  const slashMatch = text.match(/^\/model(?:\s+(.*))?$/i);
+  if (!slashMatch) return null;
+
+  const body = normalizeString(slashMatch[1] || '');
+  const compact = lower.replace(/\s+/g, '');
+  if (!body || /^(?:status|current|show|info|状态|当前|现在)$/i.test(body)) {
+    return { type: 'status' };
+  }
+
+  const commandBody = body.replace(
+    /^(?:set|use|switch|change|切换|切到|换成|换到|改成|改为|设置|设成|使用|用)\s+/i,
+    ''
+  );
+
+  const model = normalizeCodexModelName(commandBody);
+  const reasoningEffort = normalizeCodexReasoningEffort(commandBody);
+  let serviceTier = normalizeCodexServiceTier(commandBody);
+  if (!serviceTier && /(high\s*ultra|ultra\s*high)/i.test(commandBody)) {
+    serviceTier = DEFAULT_CODEX_SERVICE_TIER;
+  }
+  const serviceTierSpecified = Boolean(serviceTier)
+    || /(speed|tier|速度|快|加速|priority|prioritized|fast|default|standard|normal|普通|标准|默认|省钱)/i.test(commandBody);
+  if (!model && !reasoningEffort && !serviceTierSpecified) return null;
+
+  const command = {
+    type: 'set',
+    sourceText: text,
+    matchedText: compact,
+  };
+  if (model) command.model = model;
+  if (reasoningEffort) command.reasoningEffort = reasoningEffort;
+  if (serviceTierSpecified) command.serviceTier = serviceTier;
+  return command;
+}
+
+function handleCodexModelCommand({
+  accountName = '',
+  codex = {},
+  command = null,
+  senderIdentity = {},
+} = {}) {
+  if (!command) return { handled: false, reply: '' };
+  if (command.type === 'status') {
+    const status = buildCodexModelStatus(codex);
+    return {
+      handled: true,
+      reply: [
+        status.line,
+        '模型控制只响应 /model 命令，例如：/model switch gpt-5.6 sol ultra standard / /model switch terra 5.6 high ultra / /model speed priority。',
+      ].join('\n'),
+    };
+  }
+  if (command.type !== 'set') return { handled: false, reply: '' };
+  const before = buildCodexModelStatus(codex);
+  const sender = normalizeSenderIdentity(senderIdentity);
+  const next = {
+    model: command.model || codex.model || DEFAULT_CODEX_MODEL,
+    reasoningEffort: command.reasoningEffort || codex.reasoningEffort || DEFAULT_CODEX_REASONING_EFFORT,
+    serviceTier: Object.prototype.hasOwnProperty.call(command || {}, 'serviceTier')
+      ? command.serviceTier
+      : normalizeString(codex.serviceTier || DEFAULT_CODEX_SERVICE_TIER),
+    updatedAt: Date.now(),
+    updatedBy: sender.openId || sender.userId || sender.unionId || '',
+    sourceText: command.sourceText || '',
+  };
+  applyCodexModelSelection(codex, next);
+  writeCodexModelOverride(accountName, next);
+  const after = buildCodexModelStatus(codex);
+  return {
+    handled: true,
+    reply: [
+      '已切换这个机器人的 Codex 配置。',
+      `之前：${before.line.replace(/^当前/, '')}`,
+      `现在：${after.line.replace(/^当前/, '')}`,
+    ].join('\n'),
+  };
 }
 
 function parseKvLine(line) {
@@ -446,8 +731,34 @@ function isProcessAlive(pid) {
   }
 }
 
-function readCodexExecLockOwner() {
-  const ownerPath = path.join(FEISHU_CODEX_EXEC_LOCK_DIR, 'owner.json');
+function buildCodexExecLockScope({
+  cwd = '',
+  home = '',
+  profile = '',
+  bin = '',
+} = {}) {
+  return String(cwd || '').trim()
+    || String(home || '').trim()
+    || String(profile || '').trim()
+    || String(bin || '').trim()
+    || 'default';
+}
+
+function resolveCodexExecLockDir({
+  label = 'codex',
+  cwd = '',
+  home = '',
+  profile = '',
+  bin = '',
+} = {}) {
+  const safeLabel = String(label || 'codex').trim().replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || 'codex';
+  const scope = buildCodexExecLockScope({ cwd, home, profile, bin });
+  const scopeHash = createHash('sha1').update(scope).digest('hex').slice(0, 16);
+  return path.join(FEISHU_CODEX_EXEC_LOCK_ROOT_DIR, `${safeLabel}-${scopeHash}`);
+}
+
+function readCodexExecLockOwner(lockDir) {
+  const ownerPath = path.join(lockDir, 'owner.json');
   try {
     return JSON.parse(fs.readFileSync(ownerPath, 'utf8'));
   } catch (_) {
@@ -455,33 +766,41 @@ function readCodexExecLockOwner() {
   }
 }
 
-function isCodexExecLockStale() {
+function isCodexExecLockStale(lockDir) {
   let stat = null;
   try {
-    stat = fs.statSync(FEISHU_CODEX_EXEC_LOCK_DIR);
+    stat = fs.statSync(lockDir);
   } catch (_) {
     return false;
   }
-  const owner = readCodexExecLockOwner();
+  const owner = readCodexExecLockOwner(lockDir);
   const pid = Number(owner?.pid || 0);
   if (pid && !isProcessAlive(pid)) return true;
   return Date.now() - Number(stat.mtimeMs || 0) > CODEX_EXEC_LOCK_STALE_MS;
 }
 
-async function acquireCodexExecLock(label = 'codex') {
+async function acquireCodexExecLock({
+  label = 'codex',
+  cwd = '',
+  home = '',
+  profile = '',
+  bin = '',
+} = {}) {
   if (process.env.FEISHU_DISABLE_CODEX_EXEC_LOCK === '1') {
     return () => {};
   }
 
   ensureDirSync(FEISHU_RUNTIME_DIR);
+  ensureDirSync(FEISHU_CODEX_EXEC_LOCK_ROOT_DIR);
+  const lockDir = resolveCodexExecLockDir({ label, cwd, home, profile, bin });
   const token = randomBytes(8).toString('hex');
   const startedAt = Date.now();
   let lastWaitLogAt = 0;
   while (true) {
     try {
-      fs.mkdirSync(FEISHU_CODEX_EXEC_LOCK_DIR);
+      fs.mkdirSync(lockDir);
       fs.writeFileSync(
-        path.join(FEISHU_CODEX_EXEC_LOCK_DIR, 'owner.json'),
+        path.join(lockDir, 'owner.json'),
         `${JSON.stringify({
           pid: process.pid,
           label,
@@ -490,19 +809,19 @@ async function acquireCodexExecLock(label = 'codex') {
         }, null, 2)}\n`
       );
       return () => {
-        const owner = readCodexExecLockOwner();
+        const owner = readCodexExecLockOwner(lockDir);
         if (owner?.pid !== process.pid || owner?.token !== token) return;
-        fs.rmSync(FEISHU_CODEX_EXEC_LOCK_DIR, { recursive: true, force: true });
+        fs.rmSync(lockDir, { recursive: true, force: true });
       };
     } catch (err) {
       if (err?.code !== 'EEXIST') throw err;
-      if (isCodexExecLockStale()) {
-        fs.rmSync(FEISHU_CODEX_EXEC_LOCK_DIR, { recursive: true, force: true });
+      if (isCodexExecLockStale(lockDir)) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
         continue;
       }
       const now = Date.now();
       if (now - startedAt > 5000 && now - lastWaitLogAt > 30000) {
-        const owner = readCodexExecLockOwner();
+        const owner = readCodexExecLockOwner(lockDir);
         console.log(`codex_exec_lock_wait label=${JSON.stringify(label)} owner_pid=${owner?.pid || '(unknown)'}`);
         lastWaitLogAt = now;
       }
@@ -622,6 +941,164 @@ function resolveCredentials(config) {
     verificationToken,
     botOpenId,
   };
+}
+
+function extractBotInfoFromResponse(payload = {}) {
+  const data = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const bot = data?.bot && typeof data.bot === 'object'
+    ? data.bot
+    : data?.bot_info && typeof data.bot_info === 'object'
+      ? data.bot_info
+      : data?.app_bot && typeof data.app_bot === 'object'
+        ? data.app_bot
+        : {};
+  return {
+    openId: normalizeString(
+      data?.open_id
+      || data?.openId
+      || data?.bot_open_id
+      || data?.botOpenId
+      || bot?.open_id
+      || bot?.openId
+      || bot?.bot_open_id
+      || bot?.botOpenId
+    ),
+    name: normalizeString(
+      data?.name
+      || data?.app_name
+      || data?.bot_name
+      || data?.botName
+      || bot?.name
+      || bot?.app_name
+      || bot?.bot_name
+      || bot?.botName
+    ),
+  };
+}
+
+async function fetchFeishuJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let payload = {};
+  if (text.trim()) {
+    try {
+      payload = JSON.parse(text);
+    } catch (err) {
+      throw new Error(`invalid json response http_status=${response.status} message=${err.message}`);
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`http_status=${response.status} body=${normalizeProgressSnippet(text, 240)}`);
+  }
+  const code = payload?.code;
+  if (code !== undefined && code !== 0) {
+    throw new Error(`code=${code} api_message=${normalizeProgressSnippet(payload?.msg || payload?.message || '', 240)}`);
+  }
+  return payload;
+}
+
+function resolveFeishuApiBaseUrl(domain) {
+  if (domain && typeof domain === 'object') {
+    return resolveFeishuApiBaseUrl(domain.value ?? domain.label ?? '');
+  }
+  if (domain === lark?.Domain?.Feishu || String(domain) === '0' || String(domain).toLowerCase() === 'feishu') {
+    return 'https://open.feishu.cn';
+  }
+  if (domain === lark?.Domain?.Lark || String(domain) === '1' || String(domain).toLowerCase() === 'lark') {
+    return 'https://open.larksuite.com';
+  }
+  const raw = normalizeString(domain);
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/+$/, '');
+  return raw.replace(/\/+$/, '');
+}
+
+async function fetchFeishuTenantAccessToken({ domain, appId, appSecret }) {
+  const base = resolveFeishuApiBaseUrl(domain);
+  const payload = await fetchFeishuJson(`${base}/open-apis/auth/v3/tenant_access_token/internal`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({
+      app_id: appId,
+      app_secret: appSecret,
+    }),
+  });
+  const token = normalizeString(payload?.tenant_access_token || payload?.data?.tenant_access_token);
+  if (!token) throw new Error('tenant_access_token missing');
+  return token;
+}
+
+async function fetchFeishuBotInfo({ domain, appId, appSecret }) {
+  const base = resolveFeishuApiBaseUrl(domain);
+  const tenantAccessToken = await fetchFeishuTenantAccessToken({ domain: base, appId, appSecret });
+  const payload = await fetchFeishuJson(`${base}/open-apis/bot/v3/info`, {
+    method: 'GET',
+    headers: {
+      authorization: `Bearer ${tenantAccessToken}`,
+      'content-type': 'application/json; charset=utf-8',
+    },
+  });
+  const info = extractBotInfoFromResponse(payload);
+  if (!info.openId) throw new Error('bot open_id missing');
+  return {
+    ...info,
+    raw: payload,
+  };
+}
+
+async function ensureRuntimeBotOpenId({ accountName, creds, domain }) {
+  if (normalizeString(creds?.botOpenId?.value)) {
+    return {
+      ok: true,
+      changed: false,
+      source: creds.botOpenId.source || 'configured',
+      openId: normalizeString(creds.botOpenId.value),
+    };
+  }
+  const appId = normalizeString(creds?.appId?.value);
+  const appSecret = normalizeString(creds?.appSecret?.value);
+  if (!appId || !appSecret) {
+    return {
+      ok: false,
+      changed: false,
+      error: 'app credentials missing',
+    };
+  }
+
+  try {
+    const info = await fetchFeishuBotInfo({
+      domain: domain.value || domain,
+      appId,
+      appSecret,
+    });
+    creds.botOpenId.value = info.openId;
+    creds.botOpenId.source = 'runtime:bot_info';
+    let savedPath = '';
+    try {
+      const saved = upsertConfigEntry('feishu', accountName, {
+        bot_open_id: info.openId,
+      });
+      savedPath = saved.filePath || '';
+      creds.botOpenId.source = 'config:bot_info';
+    } catch (err) {
+      console.error(`bot_open_id_persist=error account=${accountName} message=${err.message}`);
+    }
+    console.log(`bot_open_id_fetch=ok account=${accountName} name=${info.name || '(unknown)'} source=bot_info${savedPath ? ` file=${savedPath}` : ''}`);
+    return {
+      ok: true,
+      changed: true,
+      source: creds.botOpenId.source,
+      openId: info.openId,
+      name: info.name,
+      savedPath,
+    };
+  } catch (err) {
+    console.error(`bot_open_id_fetch=error account=${accountName} ${err.message}`);
+    return {
+      ok: false,
+      changed: false,
+      error: err.message,
+    };
+  }
 }
 
 function resolveReplyMode(config) {
@@ -861,13 +1338,26 @@ function resolveCodexConfig(config) {
 
   return {
     bin: String(getArg('--codex-bin', process.env.FEISHU_CODEX_BIN || codexConfig.bin || 'codex')).trim() || 'codex',
-    model: String(getArg('--codex-model', process.env.FEISHU_CODEX_MODEL || codexConfig.model || '')).trim(),
+    model: String(getArg('--codex-model', process.env.FEISHU_CODEX_MODEL || codexConfig.model || DEFAULT_CODEX_MODEL)).trim(),
     reasoningEffort: String(
       getArg(
         '--codex-reasoning-effort',
-        process.env.FEISHU_CODEX_REASONING_EFFORT || codexConfig.reasoning_effort || ''
+        process.env.FEISHU_CODEX_REASONING_EFFORT || codexConfig.reasoning_effort || DEFAULT_CODEX_REASONING_EFFORT
       )
     ).trim(),
+    serviceTier: String(
+      getArg(
+        '--codex-service-tier',
+        process.env.FEISHU_CODEX_SERVICE_TIER || codexConfig.service_tier || codexConfig.serviceTier || DEFAULT_CODEX_SERVICE_TIER
+      )
+    ).trim(),
+    statusFooterEnabled: asBool(
+      getArg(
+        '--codex-status-footer',
+        process.env.FEISHU_CODEX_STATUS_FOOTER || codexConfig.status_footer || codexConfig.statusFooter
+      ),
+      true
+    ),
     profile: String(getArg('--codex-profile', process.env.FEISHU_CODEX_PROFILE || codexConfig.profile || '')).trim(),
     home,
     cwd,
@@ -875,9 +1365,11 @@ function resolveCodexConfig(config) {
     // Intentionally disable execution timeout: wait until the task exits naturally.
     timeoutSec: 0,
     historyTurns: asInt(getArg('--history-turns', process.env.FEISHU_HISTORY_TURNS || codexConfig.history_turns), 6, 0, 20),
-    systemPrompt: mergeTalkNormalPrompt(
-      String(getArg('--system-prompt', process.env.FEISHU_CODEX_SYSTEM_PROMPT || codexConfig.system_prompt || DEFAULT_CODEX_SYSTEM_PROMPT)).trim(),
-      DEFAULT_CODEX_SYSTEM_PROMPT
+    systemPrompt: mergeCodexExecutionGuardrailPrompt(
+      mergeTalkNormalPrompt(
+        String(getArg('--system-prompt', process.env.FEISHU_CODEX_SYSTEM_PROMPT || codexConfig.system_prompt || DEFAULT_CODEX_SYSTEM_PROMPT)).trim(),
+        DEFAULT_CODEX_SYSTEM_PROMPT
+      )
     ),
     apiKey: selectedApiKey.value,
     apiKeySource: selectedApiKey.source,
@@ -927,6 +1419,12 @@ function resolveCodexModelRoutes(codexConfig = {}) {
       process.env.FEISHU_CODEX_WRITING_REASONING_EFFORT || writingRaw.reasoning_effort || writingRaw.reasoningEffort || ''
     )
   );
+  const writingServiceTier = normalizeString(
+    getArg(
+      '--codex-writing-service-tier',
+      process.env.FEISHU_CODEX_WRITING_SERVICE_TIER || writingRaw.service_tier || writingRaw.serviceTier || ''
+    )
+  );
   const nonCodingModel = normalizeString(
     getArg(
       '--codex-non-coding-model',
@@ -937,6 +1435,12 @@ function resolveCodexModelRoutes(codexConfig = {}) {
     getArg(
       '--codex-non-coding-reasoning-effort',
       process.env.FEISHU_CODEX_NON_CODING_REASONING_EFFORT || nonCodingRaw.reasoning_effort || nonCodingRaw.reasoningEffort || ''
+    )
+  );
+  const nonCodingServiceTier = normalizeString(
+    getArg(
+      '--codex-non-coding-service-tier',
+      process.env.FEISHU_CODEX_NON_CODING_SERVICE_TIER || nonCodingRaw.service_tier || nonCodingRaw.serviceTier || ''
     )
   );
   const writingConfiguredTriggers = normalizeModelRouteKeywords(
@@ -958,6 +1462,7 @@ function resolveCodexModelRoutes(codexConfig = {}) {
       enabled: asBool(writingRaw.enabled, hasWritingRoute || Boolean(writingModel)),
       model: writingModel,
       reasoningEffort: writingReasoningEffort,
+      serviceTier: writingServiceTier,
       triggerKeywords: uniqueStrings([
         ...DEFAULT_WRITING_MODEL_ROUTE_TRIGGERS,
         ...writingConfiguredTriggers,
@@ -967,6 +1472,7 @@ function resolveCodexModelRoutes(codexConfig = {}) {
       enabled: asBool(nonCodingRaw.enabled, hasNonCodingRoute || Boolean(nonCodingModel)),
       model: nonCodingModel,
       reasoningEffort: nonCodingReasoningEffort,
+      serviceTier: nonCodingServiceTier,
       triggerKeywords: uniqueStrings([
         ...DEFAULT_NON_CODING_MODEL_ROUTE_TRIGGERS,
         ...configuredTriggers,
@@ -1002,16 +1508,19 @@ function selectCodexConfigForUserText(codex, userText = '') {
     if (!matchedKeyword) continue;
     const model = normalizeString(route.model) || normalizeString(codex.model);
     const reasoningEffort = normalizeString(route.reasoningEffort) || normalizeString(codex.reasoningEffort);
-    if (!model && !reasoningEffort) continue;
+    const serviceTier = normalizeString(route.serviceTier) || normalizeString(codex.serviceTier);
+    if (!model && !reasoningEffort && !serviceTier) continue;
     return {
       ...codex,
       model,
       reasoningEffort,
+      serviceTier,
       activeModelRoute: {
         name,
         matchedKeyword,
         model,
         reasoningEffort,
+        serviceTier,
       },
     };
   }
@@ -1024,12 +1533,14 @@ function printCodexModelRouteConfig(codex) {
   console.log(`codex_writing_route=${writingRoute.enabled ? 'true' : 'false'}`);
   console.log(`codex_writing_model=${writingRoute.model || '(default)'}`);
   console.log(`codex_writing_reasoning_effort=${writingRoute.reasoningEffort || '(default)'}`);
+  console.log(`codex_writing_service_tier=${writingRoute.serviceTier || '(default)'}`);
   console.log(`codex_writing_trigger_count=${writingTriggerCount}`);
   const route = codex?.modelRoutes?.nonCodingRequest || {};
   const triggerCount = Array.isArray(route.triggerKeywords) ? route.triggerKeywords.length : 0;
   console.log(`codex_non_coding_route=${route.enabled ? 'true' : 'false'}`);
   console.log(`codex_non_coding_model=${route.model || '(default)'}`);
   console.log(`codex_non_coding_reasoning_effort=${route.reasoningEffort || '(default)'}`);
+  console.log(`codex_non_coding_service_tier=${route.serviceTier || '(default)'}`);
   console.log(`codex_non_coding_trigger_count=${triggerCount}`);
 }
 
@@ -1160,6 +1671,14 @@ function resolveFfmpegConfig(config) {
 
 function resolveSpeechConfig(config, codex = {}) {
   const speechConfig = config.speech || {};
+  const provider = String(
+    getArg(
+      '--speech-provider',
+      process.env.FEISHU_SPEECH_PROVIDER
+        || speechConfig.provider
+        || (speechConfig.transcription_url || speechConfig.transcriptionUrl ? 'todoo_remote' : 'openai')
+    )
+  ).trim().toLowerCase() || 'openai';
   const apiKey = pickValue([
     ['cli', getArg('--speech-api-key', '')],
     ['env', process.env.FEISHU_SPEECH_API_KEY || ''],
@@ -1179,9 +1698,37 @@ function resolveSpeechConfig(config, codex = {}) {
         || 'https://api.openai.com/v1'
     )
   ).trim().replace(/\/+$/, '') || 'https://api.openai.com/v1';
+  const transcriptionURL = String(
+    getArg(
+      '--speech-transcription-url',
+      process.env.FEISHU_SPEECH_TRANSCRIPTION_URL
+        || speechConfig.transcription_url
+        || speechConfig.transcriptionUrl
+        || ''
+    )
+  ).trim();
+  const authHeader = String(
+    getArg(
+      '--speech-auth-header',
+      process.env.FEISHU_SPEECH_AUTH_HEADER
+        || speechConfig.auth_header
+        || speechConfig.authHeader
+        || ''
+    )
+  ).trim();
+  const authToken = String(
+    getArg(
+      '--speech-auth-token',
+      process.env.FEISHU_SPEECH_AUTH_TOKEN
+        || speechConfig.auth_token
+        || speechConfig.authToken
+        || ''
+    )
+  ).trim();
 
   return {
     enabled: asBool(getArg('--speech-enabled', process.env.FEISHU_SPEECH_ENABLED || speechConfig.enabled), true),
+    provider,
     model: String(
       getArg(
         '--speech-model',
@@ -1197,6 +1744,9 @@ function resolveSpeechConfig(config, codex = {}) {
     apiKey: apiKey.value,
     apiKeySource: apiKey.source,
     baseURL,
+    transcriptionURL,
+    authHeader,
+    authToken,
     ffmpegBin: ffmpeg.bin,
     ffmpegVersion: ffmpeg.version,
   };
@@ -2747,6 +3297,60 @@ function describeFeishuApiError(err) {
   if (violations) parts.push(`field_violations=${violations}`);
 
   return parts.join(' ') || 'unknown_error';
+}
+
+async function normalizeFeishuResourceDownloadError(err) {
+  const responseData = err?.response?.data;
+  let parsedPayload = null;
+  if (responseData && typeof responseData[Symbol.asyncIterator] === 'function') {
+    const chunks = [];
+    let storedBytes = 0;
+    try {
+      for await (const chunk of responseData) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (storedBytes < 64 * 1024) {
+          const remaining = 64 * 1024 - storedBytes;
+          chunks.push(buffer.subarray(0, remaining));
+          storedBytes += Math.min(buffer.length, remaining);
+        }
+      }
+      const rawBody = Buffer.concat(chunks).toString('utf8').trim();
+      if (rawBody) parsedPayload = JSON.parse(rawBody);
+    } catch (_) {
+      parsedPayload = null;
+    }
+  } else if (Buffer.isBuffer(responseData) || typeof responseData === 'string') {
+    try {
+      parsedPayload = JSON.parse(Buffer.isBuffer(responseData) ? responseData.toString('utf8') : responseData);
+    } catch (_) {
+      parsedPayload = null;
+    }
+  } else if (responseData && typeof responseData === 'object') {
+    parsedPayload = responseData;
+  }
+
+  const status = getFeishuApiStatus(err);
+  const apiCode = String(parsedPayload?.code || parsedPayload?.error?.code || '').trim();
+  const apiMessage = normalizeProgressSnippet(
+    parsedPayload?.msg || parsedPayload?.message || parsedPayload?.error?.message || '',
+    240
+  );
+  const details = [
+    String(err?.message || 'resource download failed').trim(),
+    status ? `http_status=${status}` : '',
+    apiCode ? `code=${apiCode}` : '',
+    apiMessage ? `api_message=${apiMessage}` : '',
+  ].filter(Boolean).join(' ');
+  const normalized = new Error(details);
+  normalized.cause = err;
+  normalized.status = status || undefined;
+  normalized.response = {
+    status: status || undefined,
+    data: parsedPayload || {},
+  };
+  normalized.feishuApiCode = apiCode;
+  normalized.feishuResourceFailure = apiCode === '234037' ? 'file_size_exceeds_limit' : '';
+  return normalized;
 }
 
 function extractFeishuPermissionViolations(err) {
@@ -4414,6 +5018,19 @@ function getRecentAttachmentCarry(stateMap, {
   return mergeAttachmentBundles(matched);
 }
 
+function resolveLiveRecentAttachmentBundle(expectedBundle = null, liveBundle = null) {
+  const expected = buildAttachmentBundle(expectedBundle || {});
+  const live = buildAttachmentBundle(liveBundle || {});
+  if (!hasAttachmentBundleContent(expected) || !hasAttachmentBundleContent(live)) return null;
+
+  const expectedMessageIDs = uniqueStrings(expected.sourceMessageIDs || []);
+  const liveMessageIDs = new Set(uniqueStrings(live.sourceMessageIDs || []));
+  if (expectedMessageIDs.length === 0 || !expectedMessageIDs.every((messageID) => liveMessageIDs.has(messageID))) {
+    return null;
+  }
+  return expected;
+}
+
 function consumeRecentAttachmentCarry(stateMap, {
   chatID = '',
   chatType = '',
@@ -5288,6 +5905,18 @@ function inferExtensionFromHeaders(headers, fallback = '.bin') {
   return ext || fallback;
 }
 
+function buildAudioResourceTypeCandidates(fileKey, preferredType = 'audio') {
+  const key = normalizeString(fileKey);
+  const preferred = normalizeString(preferredType).toLowerCase();
+  const keyLooksLikeFileResource = FEISHU_FILE_RESOURCE_KEY_PREFIX_RE.test(key);
+  return uniqueStrings([
+    keyLooksLikeFileResource ? 'file' : '',
+    preferred,
+    'audio',
+    'file',
+  ]);
+}
+
 function formatDurationFromMs(durationMs) {
   const ms = Math.max(0, Number(durationMs) || 0);
   if (ms <= 0) return '';
@@ -5405,6 +6034,81 @@ async function requestOpenAITranscription({ speech, model, filePath, mimeType })
   return text;
 }
 
+function extractSpeechTranscriptionText(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload.trim();
+  if (Array.isArray(payload)) {
+    return payload
+      .map((item) => extractSpeechTranscriptionText(item))
+      .filter(Boolean)
+      .join('');
+  }
+  if (typeof payload !== 'object') return '';
+
+  for (const key of ['transcription', 'polished_text', 'polishedText', 'raw_text', 'rawText', 'text', 'utterances_text', 'utterance', 'content']) {
+    const value = payload[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+
+  for (const key of ['result', 'data', 'payload']) {
+    const text = extractSpeechTranscriptionText(payload[key]);
+    if (text) return text;
+  }
+
+  for (const key of ['utterances', 'segments']) {
+    const text = extractSpeechTranscriptionText(payload[key]);
+    if (text) return text;
+  }
+
+  return '';
+}
+
+async function requestTodooRemoteTranscription({ speech, filePath, mimeType }) {
+  ensure(speech.transcriptionURL, 'todoo remote transcription url is missing');
+  const audioBuffer = fs.readFileSync(filePath);
+  const form = new FormData();
+  form.set('file', new Blob([audioBuffer], { type: mimeType || 'application/octet-stream' }), path.basename(filePath));
+
+  const headers = {};
+  if (speech.authHeader && speech.authToken) {
+    headers[speech.authHeader] = speech.authToken;
+  }
+
+  const response = await fetch(speech.transcriptionURL, {
+    method: 'POST',
+    headers,
+    body: form,
+  });
+  const raw = await response.text();
+  let parsed = null;
+  try {
+    parsed = raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    parsed = null;
+  }
+
+  if (!response.ok) {
+    const detail = String(
+      parsed?.error
+      || parsed?.detail
+      || parsed?.message
+      || raw
+      || `HTTP ${response.status}`
+    ).trim();
+    const err = new Error(`todoo remote transcription failed (${response.status}): ${detail}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  const text = extractSpeechTranscriptionText(parsed || raw);
+  ensure(text, 'todoo remote transcription returned empty text');
+  return {
+    text,
+    model: String(parsed?.model || 'todoo-remote').trim() || 'todoo-remote',
+    provider: String(parsed?.provider || 'todoo_remote').trim() || 'todoo_remote',
+  };
+}
+
 function shouldRetryTranscriptionWithFallbackModel(err) {
   const status = Number(err?.status || 0);
   const message = String(err?.message || '').toLowerCase();
@@ -5412,10 +6116,40 @@ function shouldRetryTranscriptionWithFallbackModel(err) {
   return /model/.test(message) && (/not found/.test(message) || /does not exist/.test(message) || /unsupported/.test(message));
 }
 
+function isTodooRemoteSpeechProvider(provider = '') {
+  const normalized = String(provider || '').trim().toLowerCase();
+  return normalized === 'todoo'
+    || normalized === 'todoo_remote'
+    || normalized === 'todoo-api'
+    || normalized === 'todoo_api';
+}
+
+function isMissingSpeechApiKeyError(err) {
+  const message = String(err?.message || '').toLowerCase();
+  return message.includes('api key')
+    || message.includes('apikey')
+    || message.includes('缺少语音转写');
+}
+
 async function transcribeAudioMessage(filePath, speech) {
   ensure(speech.enabled, '当前账号未启用语音转写');
-  ensure(speech.apiKey, '缺少语音转写 API key，请配置 speech.api_key 或 codex.api_key');
   const prepared = await ensureAudioReadyForTranscription(filePath, speech);
+  if (isTodooRemoteSpeechProvider(speech.provider)) {
+    const result = await requestTodooRemoteTranscription({
+      speech,
+      filePath: prepared.filePath,
+      mimeType: prepared.mimeType,
+    });
+    return {
+      text: result.text,
+      model: result.model,
+      provider: result.provider,
+      converted: prepared.converted,
+      preparedFilePath: prepared.filePath,
+    };
+  }
+
+  ensure(speech.apiKey, '缺少语音转写 API key，请配置 speech.api_key 或 codex.api_key');
   const modelCandidates = uniqueStrings([speech.model, 'whisper-1']);
   let lastError = null;
 
@@ -6627,6 +7361,9 @@ function buildCodexPrompt({
   forceExecution = false,
   memoryBundleText = '',
   thingsCommandHint = '',
+  agentGatewayHint = '',
+  resumeFailureText = '',
+  executionGuardRetry = false,
 }) {
   const lines = [];
   const message = compactText(String(userText || ''), 2400);
@@ -6636,6 +7373,15 @@ function buildCodexPrompt({
     lines.push('');
   }
   lines.push(systemPrompt || DEFAULT_CODEX_SYSTEM_PROMPT);
+  if (executionGuardRetry) {
+    lines.push('');
+    lines.push(CODEX_EXECUTION_RETRY_PROMPT);
+  }
+  if (resumeFailureText) {
+    lines.push('');
+    lines.push('内部执行提示：上一次续接 Codex 线程失败，不能因此只做口头确认；请基于当前可见上下文继续推进。');
+    lines.push(compactText(String(resumeFailureText || ''), 500));
+  }
   if (threadTitle) {
     lines.push('');
     lines.push(`当前线程：${threadTitle}`);
@@ -6657,6 +7403,10 @@ function buildCodexPrompt({
   if (thingsCommandHint) {
     lines.push('');
     lines.push(thingsCommandHint);
+  }
+  if (agentGatewayHint) {
+    lines.push('');
+    lines.push(agentGatewayHint);
   }
   lines.push('');
   lines.push('当前线程近期上下文：');
@@ -6712,6 +7462,7 @@ function buildCodexResumePrompt({
   forceExecution = false,
   memoryBundleText = '',
   thingsCommandHint = '',
+  agentGatewayHint = '',
 }) {
   const lines = [];
   const message = compactText(String(userText || ''), 2400);
@@ -6734,6 +7485,10 @@ function buildCodexResumePrompt({
     lines.push('');
     lines.push(thingsCommandHint);
   }
+  if (agentGatewayHint) {
+    lines.push('');
+    lines.push(agentGatewayHint);
+  }
   lines.push('');
   lines.push('用户最新消息：');
   lines.push(message || '(空)');
@@ -6752,7 +7507,75 @@ function shouldForceCodexExecution(rawText = '') {
     return true;
   }
   if (/`[^`\n]+`/.test(text)) return true;
-  return /(改代码|改程序|修改代码|修代码|修一下|修复|修正|排查|定位问题|找原因|加个|增加|补上|实现|支持|处理一下|优化|重构|删掉|删除|替换|更新配置|改配置|写脚本|脚本|命令|编译|构建|打包|部署|发布|刷机|烧录|固件|接口|版本号|回滚|迁移|测试一下|bug|fix|debug|implement|refactor|patch|compile|build|deploy|release|rollback|hotfix|config|firmware)/i.test(text);
+  if (/(改代码|改程序|修改代码|修代码|修一下|修复|修正|排查|定位问题|找原因|加个|增加|补上|实现|支持|处理一下|优化|重构|删掉|删除|替换|更新配置|改配置|写脚本|脚本|命令|编译|构建|打包|部署|发布|刷机|烧录|固件|接口|版本号|回滚|迁移|测试一下|bug|fix|debug|implement|refactor|patch|compile|build|deploy|release|rollback|hotfix|config|firmware)/i.test(text)) {
+    return true;
+  }
+  const inspectIntent = /(看下|看看|检查|查一下|查查|确认一下|验证一下|为什么|怎么回事)/i;
+  const inspectTarget = /(机器人|代码|配置|日志|文件|项目|仓库|接口|服务|任务|飞书|回复|不回复|不干活|挂了|停止|中断|失败|报错|聊天记录)/i;
+  return inspectIntent.test(text) && inspectTarget.test(text);
+}
+
+function mergeCodexExecutionGuardrailPrompt(prompt = '') {
+  const base = String(prompt || DEFAULT_CODEX_SYSTEM_PROMPT).trim() || DEFAULT_CODEX_SYSTEM_PROMPT;
+  if (base.includes('飞书执行规则') && base.includes('不要只回复')) return base;
+  return [base, CODEX_EXECUTION_GUARDRAIL_PROMPT].filter(Boolean).join('\n\n');
+}
+
+function isCodexObservableWorkEvent(event = null) {
+  if (!event || typeof event !== 'object') return false;
+  const type = String(event.type || '').trim().toLowerCase();
+  const item = event.item && typeof event.item === 'object' ? event.item : {};
+  const itemType = String(item.type || event.item_type || '').trim().toLowerCase();
+  if ([
+    'tool_call',
+    'command_execution',
+    'function_call',
+    'mcp_tool_call',
+    'local_shell',
+    'file_operation',
+  ].includes(itemType)) {
+    return true;
+  }
+  if (item.command || item.tool_name || item.function_name) return true;
+  return /(tool|command|shell|exec|patch|apply_patch|function_call|mcp)/i.test(type);
+}
+
+function normalizeCodexReplyForSubstanceCheck(rawText = '') {
+  return String(rawText || '')
+    .replace(/\r/g, '\n')
+    .replace(/\[\[FEISHU_SEND_(?:FILE|IMAGE):[\s\S]*?\]\]/gi, ' ')
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+function isTrivialCodexExecutionReply(rawText = '') {
+  const text = normalizeCodexReplyForSubstanceCheck(rawText);
+  if (!text || text.length > 40) return false;
+  return /^(好+的?|收到|已收到|收到啦|可以|可以的|没问题|行|ok|done|明白|知道了|我来处理|我看下|我看看|正在处理|马上处理|安排|安排上|已处理|处理了|完成|完成了|搞定|修好了|改好了|处理好了)[。.!！~～]*$/i.test(text);
+}
+
+function isNonSubstantiveCodexExecutionResult({
+  reply = '',
+  forceExecution = false,
+  workEventCount = 0,
+} = {}) {
+  if (!forceExecution) return false;
+  if (Number(workEventCount || 0) > 0) return false;
+  return isTrivialCodexExecutionReply(reply);
+}
+
+function createNonSubstantiveCodexExecutionError({
+  reply = '',
+  workEventCount = 0,
+  phase = 'fresh',
+} = {}) {
+  const err = new Error(`codex returned trivial execution reply without observable work phase=${phase} work_events=${workEventCount}`);
+  err.userVisibleSummary = [
+    'Codex 这次只返回了简短确认，没有观察到实际命令或工具步骤。',
+    '我已经拦住这类“假完成”结果；请再发一次任务，或者把缺少的文件/上下文补给机器人。',
+    reply ? `原始回复：${compactText(String(reply || ''), 80)}` : '',
+  ].filter(Boolean).join('\n');
+  return err;
 }
 
 function shouldBypassCodexSandbox(sandbox, approvalPolicy) {
@@ -6798,7 +7621,13 @@ function extractCodexDelegateDirective(rawText) {
 }
 
 async function runCodexExec(params) {
-  const releaseLock = await acquireCodexExecLock('codex-json');
+  const releaseLock = await acquireCodexExecLock({
+    label: 'codex-json',
+    cwd: params?.cwd,
+    home: params?.home,
+    profile: params?.profile,
+    bin: params?.bin,
+  });
   try {
     return await runCodexExecUnlocked(params);
   } finally {
@@ -6810,6 +7639,7 @@ function runCodexExecUnlocked({
   bin,
   model,
   reasoningEffort,
+  serviceTier,
   profile,
   home = '',
   cwd,
@@ -6837,6 +7667,7 @@ function runCodexExecUnlocked({
     if (bypassSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
     if (model) args.push('-m', model);
     if (reasoningEffort) args.push('-c', `model_reasoning_effort=\"${reasoningEffort}\"`);
+    if (serviceTier) args.push('-c', `service_tier=\"${serviceTier}\"`);
     if (!resumeId && profile) args.push('-p', profile);
     if (!resumeId && cwd) args.push('-C', cwd);
     if (!resumeId) {
@@ -6884,7 +7715,8 @@ function runCodexExecUnlocked({
     let stdout = '';
     let stdoutJsonBuffer = '';
     let observedThreadId = resumeId;
-    let lastAgentMessageText = '';
+    let lastFinalAgentMessageText = '';
+    let lastProgressAgentMessageText = '';
 
     function cleanupTempDir() {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -6921,9 +7753,13 @@ function runCodexExecUnlocked({
         if (parsed?.type === 'thread.started' && parsed?.thread_id) {
           observedThreadId = String(parsed.thread_id || '').trim() || observedThreadId;
         }
-        const agentMessageText = extractCodexAgentMessageText(parsed);
-        if (agentMessageText) {
-          lastAgentMessageText = agentMessageText;
+        const agentMessage = extractCodexAgentMessage(parsed);
+        if (agentMessage.text) {
+          if (agentMessage.isProgress) {
+            lastProgressAgentMessageText = agentMessage.text;
+          } else {
+            lastFinalAgentMessageText = agentMessage.text;
+          }
         }
         emitEvent(parsed);
       } catch (_) {
@@ -6970,11 +7806,15 @@ function runCodexExecUnlocked({
           });
           return;
         }
-        if (lastAgentMessageText) {
+        if (lastFinalAgentMessageText) {
           settleResolve({
-            reply: lastAgentMessageText,
+            reply: lastFinalAgentMessageText,
             threadId: observedThreadId,
           });
+          return;
+        }
+        if (lastProgressAgentMessageText) {
+          settleReject(new Error(`codex returned no final reply after progress: ${compactText(lastProgressAgentMessageText, 160)}`));
           return;
         }
         if (code !== 0) {
@@ -6985,11 +7825,15 @@ function runCodexExecUnlocked({
         }
         settleReject(new Error('codex returned empty reply'));
       } catch (err) {
-        if (lastAgentMessageText) {
+        if (lastFinalAgentMessageText) {
           settleResolve({
-            reply: lastAgentMessageText,
+            reply: lastFinalAgentMessageText,
             threadId: observedThreadId,
           });
+          return;
+        }
+        if (lastProgressAgentMessageText) {
+          settleReject(new Error(`codex returned no final reply after progress: ${compactText(lastProgressAgentMessageText, 160)}`));
           return;
         }
         if (code !== 0) {
@@ -7030,16 +7874,29 @@ function runCodexExecUnlocked({
   });
 }
 
-function extractCodexAgentMessageText(event = null) {
-  if (!event || typeof event !== 'object') return '';
+function extractCodexAgentMessage(event = null) {
+  if (!event || typeof event !== 'object') return { text: '', isProgress: false };
+  const phase = String(event.phase || '').trim().toLowerCase();
   if (event.type === 'agent_message' && event.text) {
-    return String(event.text || '');
+    return {
+      text: String(event.text || ''),
+      isProgress: phase === 'commentary',
+    };
   }
   const item = event.item;
   if (event.type === 'item.completed' && item?.type === 'agent_message' && item?.text) {
-    return String(item.text || '');
+    const itemPhase = String(item.phase || phase || '').trim().toLowerCase();
+    return {
+      text: String(item.text || ''),
+      isProgress: itemPhase === 'commentary',
+    };
   }
-  return '';
+  return { text: '', isProgress: false };
+}
+
+function extractCodexAgentMessageText(event = null) {
+  const message = extractCodexAgentMessage(event);
+  return message.isProgress ? '' : message.text;
 }
 
 function extractCodexJsonErrorMessages(rawText = '') {
@@ -7116,6 +7973,13 @@ function shouldRetryCodexExecError(err) {
   ].some((fragment) => text.includes(fragment));
 }
 
+function attachCodexModelStatus(result = {}, activeCodex = {}) {
+  return {
+    ...result,
+    modelStatus: buildCodexModelStatus(activeCodex),
+  };
+}
+
 function parseCodexPlainExecOutput(rawText = '') {
   const lines = String(rawText || '')
     .replace(/\r/g, '')
@@ -7166,7 +8030,7 @@ function summarizeCodexExecFailure(err, codex = {}) {
   const runtimeProvider = codex.runtimeProvider || deriveCodexRuntimeProvider(codex);
   const providerLabel = runtimeProvider.providerName || runtimeProvider.provider || 'current';
   const summaryLines = [
-    `Codex 执行失败。当前配置：provider=${providerLabel}, model=${codex.model || '(default)'}, approval=${codex.approvalPolicy || '(default)'}, sandbox=${codex.sandbox || '(default)'}`,
+    `Codex 执行失败。当前配置：provider=${providerLabel}, model=${codex.model || '(default)'}, reasoning=${codex.reasoningEffort || '(default)'}, speed=${codex.serviceTier || '(default)'}, approval=${codex.approvalPolicy || '(default)'}, sandbox=${codex.sandbox || '(default)'}`,
   ];
   if (runtimeProvider.providerBaseUrl) {
     summaryLines.push(`provider_base_url=${runtimeProvider.providerBaseUrl}`);
@@ -7270,7 +8134,13 @@ function ensureCodexHomeReady(configuredHome) {
 }
 
 async function runCodexExecPlainText(params) {
-  const releaseLock = await acquireCodexExecLock('codex-plain');
+  const releaseLock = await acquireCodexExecLock({
+    label: 'codex-plain',
+    cwd: params?.cwd,
+    home: params?.home,
+    profile: params?.profile,
+    bin: params?.bin,
+  });
   try {
     return await runCodexExecPlainTextUnlocked(params);
   } finally {
@@ -7282,6 +8152,7 @@ function runCodexExecPlainTextUnlocked({
   bin,
   model,
   reasoningEffort,
+  serviceTier,
   profile,
   home = '',
   cwd,
@@ -7299,6 +8170,7 @@ function runCodexExecPlainTextUnlocked({
     if (bypassSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
     if (model) args.push('-m', model);
     if (reasoningEffort) args.push('-c', `model_reasoning_effort=\"${reasoningEffort}\"`);
+    if (serviceTier) args.push('-c', `service_tier=\"${serviceTier}\"`);
     if (profile) args.push('-p', profile);
     if (cwd) args.push('-C', cwd);
     for (const dir of addDirs || []) {
@@ -7345,6 +8217,7 @@ function runCodexExecPlainTextUnlocked({
       reject(wrapCodexExecFailure(new Error(`codex plain spawn failed: ${err.message}`), codex || {
         home,
         model,
+        serviceTier,
         sandbox,
         approvalPolicy,
       }, 'codex plain exec failed'));
@@ -7370,6 +8243,7 @@ function runCodexExecPlainTextUnlocked({
       reject(wrapCodexExecFailure(new Error(`codex plain exec failed: ${details}`), codex || {
         home,
         model,
+        serviceTier,
         sandbox,
         approvalPolicy,
       }, 'codex plain exec failed'));
@@ -7389,6 +8263,7 @@ async function generateCodexReply({
   forceExecution = false,
   memoryBundleText = '',
   thingsCommandHint = '',
+  agentGatewayHint = '',
   onSpawn = null,
   onProgressEvent = null,
   throwIfCancelled = null,
@@ -7398,7 +8273,7 @@ async function generateCodexReply({
   if (activeCodex?.activeModelRoute) {
     const route = activeCodex.activeModelRoute;
     console.log(
-      `codex_model_route=${route.name} matched=${JSON.stringify(route.matchedKeyword || '')} model=${route.model || '(default)'} reasoning_effort=${route.reasoningEffort || '(default)'}`
+      `codex_model_route=${route.name} matched=${JSON.stringify(route.matchedKeyword || '')} model=${route.model || '(default)'} reasoning_effort=${route.reasoningEffort || '(default)'} service_tier=${route.serviceTier || '(default)'}`
     );
   }
   const imageCount = Array.isArray(imagePaths) ? imagePaths.length : 0;
@@ -7407,10 +8282,12 @@ async function generateCodexReply({
     : () => {};
   const runExec = async ({ prompt, resumeSessionId = '' }) => {
     ensureNotCancelled();
-    return runCodexExec({
+    let workEventCount = 0;
+    const result = await runCodexExec({
       bin: activeCodex.bin,
       model: activeCodex.model,
       reasoningEffort: activeCodex.reasoningEffort,
+      serviceTier: activeCodex.serviceTier,
       profile: activeCodex.profile,
       home: activeCodex.home,
       cwd: activeCodex.cwd,
@@ -7422,8 +8299,15 @@ async function generateCodexReply({
       imagePaths,
       resumeSessionId,
       onSpawn,
-      onEvent: onProgressEvent,
+      onEvent: (event) => {
+        if (isCodexObservableWorkEvent(event)) workEventCount += 1;
+        if (typeof onProgressEvent === 'function') onProgressEvent(event);
+      },
     });
+    return {
+      ...result,
+      workEventCount,
+    };
   };
 
   const runExecWithRecovery = async ({ prompt, resumeSessionId = '' }) => {
@@ -7441,10 +8325,12 @@ async function generateCodexReply({
         `codex_exec_retry reason=${JSON.stringify(compactText(String(err.message || ''), 240))} isolated_home=${isolatedHome}`
       );
       try {
+        let retryWorkEventCount = 0;
         const retryResult = await runCodexExec({
           bin: activeCodex.bin,
           model: activeCodex.model,
           reasoningEffort: activeCodex.reasoningEffort,
+          serviceTier: activeCodex.serviceTier,
           profile: activeCodex.profile,
           home: isolatedHome,
           cwd: activeCodex.cwd,
@@ -7456,10 +8342,16 @@ async function generateCodexReply({
           imagePaths,
           resumeSessionId: '',
           onSpawn,
-          onEvent: onProgressEvent,
+          onEvent: (event) => {
+            if (isCodexObservableWorkEvent(event)) retryWorkEventCount += 1;
+            if (typeof onProgressEvent === 'function') onProgressEvent(event);
+          },
         });
         if (String(retryResult?.reply || '').trim()) {
-          return retryResult;
+          return {
+            ...retryResult,
+            workEventCount: retryWorkEventCount,
+          };
         }
         throw new Error('codex returned empty reply');
       } catch (retryErr) {
@@ -7468,10 +8360,11 @@ async function generateCodexReply({
           `codex_exec_plain_retry reason=${JSON.stringify(compactText(String(retryErr.message || ''), 240))} isolated_home=${isolatedHome}`
         );
         try {
-          return await runCodexExecPlainText({
+          const plainResult = await runCodexExecPlainText({
             bin: activeCodex.bin,
             model: activeCodex.model,
             reasoningEffort: activeCodex.reasoningEffort,
+            serviceTier: activeCodex.serviceTier,
             profile: activeCodex.profile,
             home: isolatedHome,
             cwd: activeCodex.cwd,
@@ -7483,6 +8376,10 @@ async function generateCodexReply({
             imagePaths,
             codex: activeCodex,
           });
+          return {
+            ...plainResult,
+            workEventCount: 0,
+          };
         } finally {
           removePathSync(isolatedHome);
         }
@@ -7500,6 +8397,7 @@ async function generateCodexReply({
     }
   }
 
+  let resumeFailureText = '';
   if (resolvedSessionId) {
     try {
       const resumed = await runExec({
@@ -7510,40 +8408,84 @@ async function generateCodexReply({
           forceExecution,
           memoryBundleText,
           thingsCommandHint,
+          agentGatewayHint,
         }),
         resumeSessionId: resolvedSessionId,
       });
-      return {
+      if (isNonSubstantiveCodexExecutionResult({
+        reply: resumed?.reply,
+        forceExecution,
+        workEventCount: resumed?.workEventCount,
+      })) {
+        console.error(
+          `codex_execution_guard=resume_trivial thread_id=${resolvedSessionId} work_events=${resumed?.workEventCount || 0} reply=${JSON.stringify(compactText(String(resumed?.reply || ''), 80))}`
+        );
+        throw createNonSubstantiveCodexExecutionError({
+          reply: resumed?.reply,
+          workEventCount: resumed?.workEventCount,
+          phase: 'resume',
+        });
+      }
+      return attachCodexModelStatus({
         reply: String(resumed?.reply || ''),
         threadId: String(resumed?.threadId || resolvedSessionId),
-      };
+      }, activeCodex);
     } catch (err) {
       ensureNotCancelled();
+      resumeFailureText = String(err?.userVisibleSummary || err?.message || '').trim();
       console.error(`codex_resume=error thread_id=${resolvedSessionId} message=${err.message}`);
     }
   }
 
   ensureNotCancelled();
-  const fresh = await runExecWithRecovery({
-    prompt: buildCodexPrompt({
-      systemPrompt: activeCodex.systemPrompt,
-      history,
-      userText,
-      imageCount,
-      cwd: activeCodex.cwd,
-      addDirs: activeCodex.addDirs,
-      fileWorkspaceDir,
-      threadTitle,
-      forceExecution,
-      memoryBundleText,
-      thingsCommandHint,
-    }),
+  const buildFreshPrompt = (executionGuardRetry = false) => buildCodexPrompt({
+    systemPrompt: activeCodex.systemPrompt,
+    history,
+    userText,
+    imageCount,
+    cwd: activeCodex.cwd,
+    addDirs: activeCodex.addDirs,
+    fileWorkspaceDir,
+    threadTitle,
+    forceExecution,
+    memoryBundleText,
+    thingsCommandHint,
+    agentGatewayHint,
+    resumeFailureText,
+    executionGuardRetry,
   });
+  let fresh = await runExecWithRecovery({
+    prompt: buildFreshPrompt(false),
+  });
+  if (isNonSubstantiveCodexExecutionResult({
+    reply: fresh?.reply,
+    forceExecution,
+    workEventCount: fresh?.workEventCount,
+  })) {
+    console.error(
+      `codex_execution_guard=retry phase=fresh work_events=${fresh?.workEventCount || 0} reply=${JSON.stringify(compactText(String(fresh?.reply || ''), 80))}`
+    );
+    ensureNotCancelled();
+    fresh = await runExecWithRecovery({
+      prompt: buildFreshPrompt(true),
+    });
+  }
+  if (isNonSubstantiveCodexExecutionResult({
+    reply: fresh?.reply,
+    forceExecution,
+    workEventCount: fresh?.workEventCount,
+  })) {
+    throw createNonSubstantiveCodexExecutionError({
+      reply: fresh?.reply,
+      workEventCount: fresh?.workEventCount,
+      phase: 'fresh_retry',
+    });
+  }
 
-  return {
+  return attachCodexModelStatus({
     reply: String(fresh?.reply || ''),
     threadId: String(fresh?.threadId || ''),
-  };
+  }, activeCodex);
 }
 
 function runLocalModelPrompt({
@@ -7820,6 +8762,7 @@ async function judgeScheduledTaskIntentWithCodex(codex, payload = {}) {
   const result = await runCodexExec({
     bin: codex.bin,
     model: codex.model,
+    serviceTier: codex.serviceTier,
     reasoningEffort: 'low',
     profile: codex.profile,
     cwd: codex.cwd,
@@ -8225,8 +9168,16 @@ function splitTextForFeishu(text, maxLength = FEISHU_TEXT_CHUNK_LIMIT) {
   return chunks;
 }
 
+function normalizeFeishuDisplayText(rawText) {
+  let text = String(rawText || '').replace(/\r/g, '');
+  if (!text) return '';
+  text = text.replace(/```(?:[A-Za-z0-9_-]+)?\n(https?:\/\/[^\s`]+)\n```/g, '$1');
+  text = text.replace(/`(https?:\/\/[^\s`]+)`/g, '$1');
+  return text;
+}
+
 function shouldRenderFeishuMarkdown(rawText) {
-  const text = String(rawText || '').replace(/\r/g, '').trim();
+  const text = normalizeFeishuDisplayText(rawText).trim();
   if (!text) return false;
   if (text.includes('```')) return true;
   if (/`[^`\n]+`/.test(text)) return true;
@@ -8254,7 +9205,7 @@ async function sendRenderedReply(client, chatID, rawText, {
   logTag = 'reply',
   preferMarkdown = true,
 } = {}) {
-  const normalized = String(rawText || '').replace(/\r/g, '').trim();
+  const normalized = normalizeFeishuDisplayText(rawText).trim();
   if (!normalized) return 0;
 
   const renderMarkdown = preferMarkdown && shouldRenderFeishuMarkdown(normalized);
@@ -8933,15 +9884,20 @@ async function downloadFileToDownloads(client, {
   fileKey = '',
   fileName = '',
 } = {}) {
-  const resource = await client.im.v1.messageResource.get({
-    params: {
-      type: 'file',
-    },
-    path: {
-      message_id: messageID,
-      file_key: fileKey,
-    },
-  });
+  let resource;
+  try {
+    resource = await client.im.v1.messageResource.get({
+      params: {
+        type: 'file',
+      },
+      path: {
+        message_id: messageID,
+        file_key: fileKey,
+      },
+    });
+  } catch (err) {
+    throw await normalizeFeishuResourceDownloadError(err);
+  }
   const dirPath = buildIncomingAttachmentDir(workspaceDir, accountName, 'file', messageID);
   fs.mkdirSync(dirPath, { recursive: true });
   const fallbackExt = inferExtensionFromHeaders(resource.headers, path.extname(fileName || '') || '.bin');
@@ -8960,22 +9916,39 @@ async function downloadFileToDownloads(client, {
 
 async function downloadAudioToTempFile(client, messageID, fileKey) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'feishu-audio-'));
-  const resource = await client.im.v1.messageResource.get({
-    params: {
-      type: 'audio',
-    },
-    path: {
-      message_id: messageID,
-      file_key: fileKey,
-    },
-  });
-  const ext = inferExtensionFromHeaders(resource.headers, '.opus');
-  const filePath = path.join(
-    tempDir,
-    `voice-${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`
-  );
-  await resource.writeFile(filePath);
-  return { tempDir, filePath, extension: ext };
+  const typeCandidates = buildAudioResourceTypeCandidates(fileKey);
+  const failures = [];
+  let lastError = null;
+
+  for (const resourceType of typeCandidates) {
+    try {
+      const resource = await client.im.v1.messageResource.get({
+        params: {
+          type: resourceType,
+        },
+        path: {
+          message_id: messageID,
+          file_key: fileKey,
+        },
+      });
+      const ext = inferExtensionFromHeaders(resource.headers, '.opus');
+      const filePath = path.join(
+        tempDir,
+        `voice-${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`
+      );
+      await resource.writeFile(filePath);
+      return { tempDir, filePath, extension: ext, resourceType };
+    } catch (err) {
+      lastError = err;
+      failures.push(`type=${resourceType} ${describeFeishuApiError(err)}`);
+    }
+  }
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  const err = new Error(`audio resource download failed: ${failures.join(' | ')}`);
+  err.cause = lastError;
+  err.resourceTypes = typeCandidates;
+  throw err;
 }
 
 async function sendTextReplyWithFakeStream(client, chatID, text, fakeStream) {
@@ -9216,10 +10189,15 @@ async function main() {
   const mentionConfig = resolveMentionConfig(config);
   const fakeStream = resolveFakeStreamConfig(config);
   const personalProxy = resolvePersonalProxyConfig(config, accountName);
+  const agentGateway = resolveAgentGatewayConfig(config);
   const workspace = resolveFeishuWorkspaceConfig(config, accountName);
 
   const creds = resolveCredentials(config);
   const codex = resolveCodexConfig(config);
+  const codexModelOverride = readCodexModelOverride(accountName);
+  if (codexModelOverride.exists) {
+    applyCodexModelSelection(codex, codexModelOverride);
+  }
   const localModel = resolveLocalModelConfig(config);
   const memory = resolveMemoryConfig(config);
   const speech = resolveSpeechConfig(config, codex);
@@ -9263,6 +10241,17 @@ async function main() {
     console.log(`workspace_incoming_dir=${workspace.incomingDir}`);
     console.log(`workspace_output_dir=${workspace.outputDir}`);
     console.log(`workspace_temp_dir=${workspace.tempDir}`);
+    console.log(`chat_records_dir=${resolveChatRecordPath({ botName, accountName, date: new Date() })}`);
+    console.log(`agent_gateway_enabled=${agentGateway.enabled ? 'true' : 'false'}`);
+    console.log(`agent_gateway_mode=${agentGateway.mode}`);
+    console.log(`agent_gateway_chatlog_first=${agentGateway.chatlogFirst ? 'true' : 'false'}`);
+    console.log(`agent_gateway_normal_chat_executor=${agentGateway.normalChatExecutor}`);
+    console.log(`agent_gateway_coding_executor=${agentGateway.codingExecutor}`);
+    console.log(`agent_gateway_store_ops=${agentGateway.storeOps.enabled ? 'true' : 'false'}`);
+    console.log(`agent_gateway_store_ops_prefer_mcp=${agentGateway.storeOps.preferMcp ? 'true' : 'false'}`);
+    console.log(`agent_gateway_store_ops_require_mcp_first=${agentGateway.storeOps.requireMcpFirst ? 'true' : 'false'}`);
+    console.log(`agent_gateway_store_ops_mcp=${agentGateway.storeOps.mcpName}`);
+    console.log(`agent_gateway_dashboard=${agentGateway.dashboard.enabled ? `${agentGateway.dashboard.host}:${agentGateway.dashboard.port}` : '(disabled)'}`);
     console.log(`typing_indicator=${typing.enabled ? 'true' : 'false'}`);
     console.log(`typing_emoji=${typing.emoji}`);
     console.log(`fake_stream=${fakeStream.enabled ? 'true' : 'false'}`);
@@ -9296,6 +10285,9 @@ async function main() {
     if (codex.apiKeySource) console.log(`codex_api_key_source=${codex.apiKeySource}`);
     console.log(`codex_model=${codex.model || '(default)'}`);
     console.log(`codex_reasoning_effort=${codex.reasoningEffort || '(default)'}`);
+    console.log(`codex_service_tier=${codex.serviceTier || '(default)'}`);
+    console.log(`codex_status_footer=${codex.statusFooterEnabled ? 'true' : 'false'}`);
+    console.log(`codex_model_override=${codexModelOverride.exists ? codexModelOverridePath(accountName) : '(none)'}`);
     printCodexModelRouteConfig(codex);
     console.log(`codex_profile=${codex.profile || '(default)'}`);
     console.log(`codex_home=${codex.home || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')}`);
@@ -9332,11 +10324,14 @@ async function main() {
     console.log(`memory_role_memory_chars=${memory.roleMemory.length}`);
     if (memory.enabled) console.log(`memory_store=${botMemoryStorePath(accountName)}`);
     console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
+    console.log(`speech_provider=${speech.provider}`);
     console.log(`speech_api_key_found=${speech.apiKey ? 'true' : 'false'}`);
     if (speech.apiKeySource) console.log(`speech_api_key_source=${speech.apiKeySource}`);
     console.log(`speech_model=${speech.model}`);
     console.log(`speech_language=${speech.language || '(auto)'}`);
     console.log(`speech_base_url=${speech.baseURL}`);
+    console.log(`speech_transcription_url=${speech.transcriptionURL || '(none)'}`);
+    console.log(`speech_auth_token_found=${speech.authToken ? 'true' : 'false'}`);
     console.log(`speech_ffmpeg_bin=${speech.ffmpegBin || '(not found)'}`);
     if (speech.ffmpegVersion) console.log(`speech_ffmpeg_version=${speech.ffmpegVersion}`);
     console.log(`daily_report_enabled=${dailyReport.enabled ? 'true' : 'false'}`);
@@ -9368,6 +10363,11 @@ async function main() {
     domain: domain.value,
   };
   const client = new lark.Client(baseConfig);
+  await ensureRuntimeBotOpenId({
+    accountName,
+    creds,
+    domain,
+  });
   const busyTargetCounts = new Map();
   const scheduledJobManager = createScheduledJobManager({
     accountName,
@@ -9499,24 +10499,65 @@ async function main() {
       console.log(`mention_fallback=recent_text_pair message_id=${dispatchMeta.recentTextMessageID || '(unknown)'}`);
     }
 
+    const recordChat = (record = {}) => appendChatRecord({
+      botName,
+      accountName,
+      record: {
+        chat_id: chatID,
+        chat_type: chatType || '',
+        chat_scope: conversationScope.key || '',
+        chat_scope_kind: conversationScope.kind || '',
+        chat_scope_actor: conversationScope.actorKey || '',
+        message_id: messageID,
+        message_type: messageType,
+        sender: senderIdentity,
+        ...record,
+      },
+    });
+    const appendCurrentCodexStatus = (reply = '', status = null) => {
+      if (replyMode !== 'codex' && !status) return String(reply || '');
+      return appendCodexModelStatusFooter(reply, status || codex, codex.statusFooterEnabled);
+    };
+
+    recordChat({
+      direction: 'in',
+      event: 'message_received',
+      text: compactText(text || normalizedMessageText || parsedFile.text || parsedPost.text || '', 4000),
+      raw_text: compactText(normalizedMessageText || parsedFile.text || parsedPost.text || '', 4000),
+      mention_count: mentions.length,
+      bot_mentioned: Boolean(botMentioned || mentionMatchedByMentionName || mentionMatchedByText || mentionMatchedByCarry),
+      attachments: {
+        file: parsedFile.fileKey ? [{ file_key: parsedFile.fileKey, file_name: parsedFile.fileName, file_size: parsedFile.fileSize }] : [],
+        audio: parsedAudio.fileKey ? [{ file_key: parsedAudio.fileKey, duration_ms: parsedAudio.durationMs }] : [],
+        image_keys: normalizedImageKeys,
+        post_image_keys: parsedPost.imageKeys || [],
+        post_file_count: Array.isArray(parsedPost.fileAttachments) ? parsedPost.fileAttachments.length : 0,
+      },
+    });
+
     if (!chatID) {
       console.log('skip_reason=missing_chat_id');
+      recordChat({ direction: 'system', event: 'skip', reason: 'missing_chat_id' });
       return;
     }
     if (ignoreSelf && senderType && senderType !== 'user') {
       console.log('skip_reason=non_user_sender');
+      recordChat({ direction: 'system', event: 'skip', reason: 'non_user_sender' });
       return;
     }
     if (ignoreSelf && senderOpenID && creds.botOpenId.value && senderOpenID === creds.botOpenId.value) {
       console.log('skip_reason=self_open_id');
+      recordChat({ direction: 'system', event: 'skip', reason: 'self_open_id' });
       return;
     }
     if (!autoReply) {
       console.log('skip_reason=auto_reply_disabled');
+      recordChat({ direction: 'system', event: 'skip', reason: 'auto_reply_disabled' });
       return;
     }
     if (messageType !== 'text' && messageType !== 'image' && messageType !== 'post' && messageType !== 'file' && messageType !== 'audio') {
       console.log('skip_reason=unsupported_message_type');
+      recordChat({ direction: 'system', event: 'skip', reason: 'unsupported_message_type' });
       return;
     }
     const mentionRequired = dispatchMeta.mentionRequired !== false;
@@ -9525,6 +10566,13 @@ async function main() {
       console.log('skip_reason=require_mention_not_met');
       console.log(`mention_count=${mentions.length}`);
       console.log(`text_has_at=${/[@＠]/.test(String(normalizedMessageText || '')) ? 'true' : 'false'}`);
+      recordChat({
+        direction: 'system',
+        event: 'skip',
+        reason: 'require_mention_not_met',
+        mention_count: mentions.length,
+        text_has_at: /[@＠]/.test(String(normalizedMessageText || '')),
+      });
       return;
     }
     const incomingText = compactText(text, 4000).trim();
@@ -9537,11 +10585,19 @@ async function main() {
           command: crossChatCommand,
         });
         if (result.handled) {
-          await sendRenderedReply(client, chatID, result.reply, {
+          const crossChatReply = appendCurrentCodexStatus(result.reply);
+          await sendRenderedReply(client, chatID, crossChatReply, {
             logTag: 'cross_chat_reply',
             preferMarkdown: false,
           });
           console.log(`reply=ok mode=cross_chat_command target=${result.targetChatID || '(none)'}`);
+          recordChat({
+            direction: 'out',
+            event: 'reply',
+            mode: 'cross_chat_command',
+            target_chat_id: result.targetChatID || '',
+            text: compactText(crossChatReply, 4000),
+          });
           return;
         }
       }
@@ -9574,25 +10630,47 @@ async function main() {
     });
     if (messageType === 'file' && !hasAttachmentBundleContent(currentAttachmentBundle)) {
       console.log('skip_reason=missing_file_key');
-      await sendTextReplySafe(client, chatID, '文件接收失败，请重新发送。', 'file_download_reply');
+      const failureReply = appendCurrentCodexStatus('文件接收失败，请重新发送。');
+      await sendTextReplySafe(client, chatID, failureReply, 'file_download_reply');
+      recordChat({ direction: 'out', event: 'error', mode: 'file_download', text: failureReply });
       return;
     }
     if (messageType === 'image' && !hasAttachmentBundleContent(currentAttachmentBundle)) {
       console.log('skip_reason=missing_image_key');
-      await sendTextReplySafe(client, chatID, '图片接收失败，请重新发送。', 'image_download_reply');
+      const failureReply = appendCurrentCodexStatus('图片接收失败，请重新发送。');
+      await sendTextReplySafe(client, chatID, failureReply, 'image_download_reply');
+      recordChat({ direction: 'out', event: 'error', mode: 'image_download', text: failureReply });
       return;
     }
     if (messageType === 'audio' && !hasAttachmentBundleContent(currentAttachmentBundle)) {
       console.log('skip_reason=missing_audio_key');
-      await sendTextReplySafe(client, chatID, '语音接收失败，请重新发送。', 'audio_download_reply');
+      const failureReply = appendCurrentCodexStatus('语音接收失败，请重新发送。');
+      await sendTextReplySafe(client, chatID, failureReply, 'audio_download_reply');
+      recordChat({ direction: 'out', event: 'error', mode: 'audio_download', text: failureReply });
       return;
     }
     const quotedAttachmentBundle = quotedMessageItem
       ? extractAttachmentBundleFromMessageItem(quotedMessageItem, { mentionAliases, timestamp: now })
       : null;
-    const recentAttachmentBundle = dispatchMeta.allowAttachmentCarry
+    const expectedRecentAttachmentBundle = dispatchMeta.allowAttachmentCarry
       ? dispatchMeta.recentAttachments || null
       : null;
+    const recentAttachmentBundle = expectedRecentAttachmentBundle
+      ? resolveLiveRecentAttachmentBundle(
+        expectedRecentAttachmentBundle,
+        getRecentAttachmentCarry(recentAttachmentInputs, {
+          chatID,
+          chatType,
+          senderIdentity,
+          messageID,
+          now: Date.now(),
+        })
+      )
+      : null;
+    if (expectedRecentAttachmentBundle && !recentAttachmentBundle) {
+      const staleMessageIDs = uniqueStrings(expectedRecentAttachmentBundle?.sourceMessageIDs || []);
+      console.log(`attachment_carry=stale skipped_message_ids=${staleMessageIDs.join(',') || '(none)'}`);
+    }
     let historyAttachmentBundle = null;
     let attachmentSelection = selectAttachmentSource({
       currentAttachmentBundle,
@@ -9665,6 +10743,7 @@ async function main() {
     }
 
     let attachmentFailureReply = '';
+    const fileDownloadErrors = [];
 
     if (fileDescriptors.length > 0) {
       for (const descriptor of fileDescriptors) {
@@ -9684,13 +10763,16 @@ async function main() {
           });
           incomingAttachmentFacts.push(`已接收文件：${downloaded.fileName}，保存在 ${downloaded.relativePath}`);
         } catch (err) {
+          fileDownloadErrors.push(err);
           console.error(
             `file_download=error source=${attachmentSource || 'current_message_attachment'} message_id=${descriptor.messageID} key=${descriptor.fileKey} message=${err.message}`
           );
         }
       }
       if (fileAttachments.length === 0) {
-        attachmentFailureReply = '文件下载失败，请稍后重试。';
+        attachmentFailureReply = fileDownloadErrors.some((err) => err?.feishuResourceFailure === 'file_size_exceeds_limit')
+          ? '文件超过飞书机器人下载上限，请压缩分卷或改发云盘链接。'
+          : '文件下载失败，请稍后重试。';
       }
     }
 
@@ -9727,6 +10809,9 @@ async function main() {
         try {
           downloadedAudio = await downloadAudioToTempFile(client, descriptor.messageID, descriptor.fileKey);
           tempPathsToCleanup.push(downloadedAudio.tempDir);
+          console.log(
+            `audio_download=ok source=${attachmentSource || 'current_message_attachment'} message_id=${descriptor.messageID} key=${descriptor.fileKey} type=${downloadedAudio.resourceType || '(unknown)'} ext=${downloadedAudio.extension || ''}`
+          );
         } catch (err) {
           console.error(
             `audio_download=error source=${attachmentSource || 'current_message_attachment'} message_id=${descriptor.messageID} key=${descriptor.fileKey} message=${err.message}`
@@ -9750,7 +10835,9 @@ async function main() {
           if (!attachmentFailureReply) {
             attachmentFailureReply = missingFfmpeg
               ? '当前环境缺少语音转码能力，请保留 bundled ffmpeg-static 或安装 ffmpeg 后重试。'
-              : '语音转写失败，请检查 speech.api_key / 网络后重试。';
+              : isMissingSpeechApiKeyError(err)
+                ? '语音已收到，但当前机器人缺少语音转写 API key。请配置 speech.api_key、OPENAI_API_KEY 或 CODEX_API_KEY 后重试。'
+                : '语音转写失败，请检查 speech.api_key / 网络后重试。';
           }
         }
       }
@@ -9764,7 +10851,34 @@ async function main() {
       }
 
       if (fileAttachments.length === 0 && imagePaths.length === 0 && audioTranscripts.length === 0) {
-        await sendTextReplySafe(client, chatID, attachmentFailureReply || '附件处理失败，请稍后重试。', 'attachment_download_reply');
+        if (usedRecentTextCarry) {
+          consumeRecentTextCarry(recentTextInputs, {
+            chatID,
+            chatType,
+            senderIdentity,
+            messageID: dispatchMeta.recentTextMessageID || '',
+          });
+        }
+        const failedAttachmentMessageIDs = selectedAttachmentBundle?.sourceMessageIDs || [];
+        const consumedFailedAttachments = consumeRecentAttachmentCarry(recentAttachmentInputs, {
+          chatID,
+          chatType,
+          senderIdentity,
+          messageIDs: failedAttachmentMessageIDs,
+        });
+        if (consumedFailedAttachments.length > 0) {
+          console.log(
+            `attachment_carry=consumed reason=download_failed message_ids=${uniqueStrings(failedAttachmentMessageIDs).join(',')}`
+          );
+        }
+        const failureReply = appendCurrentCodexStatus(attachmentFailureReply || '附件处理失败，请稍后重试。');
+        await sendTextReplySafe(client, chatID, failureReply, 'attachment_download_reply');
+        recordChat({
+          direction: 'out',
+          event: 'error',
+          mode: 'attachment_download',
+          text: failureReply,
+        });
         return;
       }
 
@@ -9844,6 +10958,7 @@ async function main() {
       userText = incomingText;
       if (!userText) {
         console.log('skip_reason=empty_text');
+        recordChat({ direction: 'system', event: 'skip', reason: 'empty_text' });
         return;
       }
       historyUserText = userText;
@@ -9866,6 +10981,38 @@ async function main() {
       });
       if (commandResult.handled) {
         console.log(`reply=ok mode=personal_proxy_command type=${personalProxyCommand.type}`);
+        recordChat({
+          direction: 'system',
+          event: 'personal_proxy_command',
+          mode: personalProxyCommand.type || '',
+        });
+        return;
+      }
+    }
+
+    const codexModelCommandText = messageType === 'text'
+      ? incomingText
+      : audioTranscripts.length > 0
+        ? audioTranscripts.map((item) => item.text).filter(Boolean).join('\n')
+        : '';
+    const codexModelCommand = codexModelCommandText ? parseCodexModelCommand(codexModelCommandText) : null;
+    if (codexModelCommand) {
+      const commandResult = handleCodexModelCommand({
+        accountName,
+        codex,
+        command: codexModelCommand,
+        senderIdentity,
+      });
+      if (commandResult.handled) {
+        const modelReply = appendCurrentCodexStatus(commandResult.reply);
+        await sendTextReplySafe(client, chatID, modelReply, 'codex_model_reply');
+        console.log(`reply=ok mode=codex_model_command type=${codexModelCommand.type}`);
+        recordChat({
+          direction: 'out',
+          event: 'reply',
+          mode: 'codex_model_command',
+          text: compactText(modelReply, 4000),
+        });
         return;
       }
     }
@@ -9892,9 +11039,15 @@ async function main() {
       });
       if (taskCommandResult?.handled) {
         if (taskCommandResult.reply) {
-          await sendTextReplySafe(client, chatID, taskCommandResult.reply, 'scheduled_task_reply');
+          await sendTextReplySafe(client, chatID, appendCurrentCodexStatus(taskCommandResult.reply), 'scheduled_task_reply');
         }
         console.log('reply=ok mode=scheduled_task');
+        recordChat({
+          direction: taskCommandResult.reply ? 'out' : 'system',
+          event: 'reply',
+          mode: 'scheduled_task',
+          text: compactText(appendCurrentCodexStatus(String(taskCommandResult.reply || '')), 4000),
+        });
         return;
       }
       if (taskCommandResult?.passthroughText) {
@@ -9906,9 +11059,16 @@ async function main() {
       if (threadCommand) {
         const result = handleThreadCommand(chatState, threadCommand);
         if (result.handled) {
-          await sendTextReplySafe(client, chatID, result.reply, 'thread_reply');
+          const threadReply = appendCurrentCodexStatus(result.reply);
+          await sendTextReplySafe(client, chatID, threadReply, 'thread_reply');
           console.log(`thread_state total=${chatState.order.length} current=${chatState.currentThreadId}`);
           console.log(`reply=ok mode=thread_command thread=${chatState.currentThreadId}`);
+          recordChat({
+            direction: 'out',
+            event: 'reply',
+            mode: 'thread_command',
+            text: compactText(threadReply, 4000),
+          });
           return;
         }
       }
@@ -9916,20 +11076,29 @@ async function main() {
       if (isResetCommand(userText)) {
         const currentThread = getCurrentThread(chatState);
         if (!currentThread) {
-          await sendTextReplySafe(client, chatID, '当前线程不存在，请先用 /thread new 创建。', 'reset_reply');
+          const resetReply = appendCurrentCodexStatus('当前线程不存在，请先用 /thread new 创建。');
+          await sendTextReplySafe(client, chatID, resetReply, 'reset_reply');
           console.log('reply=ok mode=reset_missing_thread');
+          recordChat({
+            direction: 'out',
+            event: 'reply',
+            mode: 'reset_missing_thread',
+            text: resetReply,
+          });
           return;
         }
         currentThread.history = [];
         currentThread.codexThreadId = '';
         currentThread.updatedAt = Date.now();
-        await sendTextReplySafe(
-          client,
-          chatID,
-          `已清空当前线程上下文：${currentThread.id} · ${currentThread.name}`,
-          'reset_reply'
-        );
+        const resetReply = appendCurrentCodexStatus(`已清空当前线程上下文：${currentThread.id} · ${currentThread.name}`);
+        await sendTextReplySafe(client, chatID, resetReply, 'reset_reply');
         console.log(`reply=ok mode=reset thread=${currentThread.id}`);
+        recordChat({
+          direction: 'out',
+          event: 'reply',
+          mode: 'reset',
+          text: resetReply,
+        });
         return;
       }
     }
@@ -10059,6 +11228,11 @@ async function main() {
     const thingsCommandHint = replyMode === 'codex' && messageType === 'text'
       ? buildThingsCommandHint(parsedThingsCommand)
       : '';
+    const agentGatewayRoute = classifyAgentGatewayRequest(historyUserText || userText, agentGateway);
+    const agentGatewayHint = buildAgentGatewayCodexHint(agentGatewayRoute, agentGateway);
+    if (agentGateway.enabled) {
+      console.log(`agent_gateway_route=${summarizeAgentGatewayRoute(agentGatewayRoute)}`);
+    }
     const guardedUserText = replyMode === 'codex' && messageType === 'text'
       ? buildThingsCommandGuardedUserText(userText, parsedThingsCommand)
       : userText;
@@ -10086,12 +11260,14 @@ async function main() {
       }
     });
 
+    let effectiveCodexModelStatus = null;
+
     try {
       taskControl.throwIfCancelled();
       if (progressReporter) {
         await progressReporter.start();
       } else if (progress.enabled) {
-        await sendTextReplySafe(client, chatID, progress.message, 'progress_notice');
+        await sendTextReplySafe(client, chatID, appendCurrentCodexStatus(progress.message), 'progress_notice');
         console.log('progress_notice=sent');
       }
       taskControl.throwIfCancelled();
@@ -10104,7 +11280,7 @@ async function main() {
           throw new Error('current thread not found');
         }
         const history = currentThread.history || [];
-        const forceExecution = shouldForceCodexExecution(historyUserText || userText);
+        const forceExecution = shouldForceCodexExecution(historyUserText || userText) || Boolean(agentGatewayRoute.requiresExecution);
         console.log(`codex_force_execution=${forceExecution ? 'true' : 'false'}`);
         const codexThreadTitle = buildCodexThreadTitle({
           botName: botName || accountName,
@@ -10122,6 +11298,7 @@ async function main() {
           forceExecution,
           memoryBundleText,
           thingsCommandHint,
+          agentGatewayHint,
           throwIfCancelled: () => taskControl.throwIfCancelled(),
           onSpawn: (child) => {
             taskControl.attachCodexChild(child);
@@ -10140,6 +11317,7 @@ async function main() {
         });
         taskControl.throwIfCancelled();
         replyText = codexReply.reply;
+        effectiveCodexModelStatus = codexReply.modelStatus || buildCodexModelStatus(codex);
         if (codexReply.threadId) {
           currentThread.codexThreadId = codexReply.threadId;
           const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle, codex.home);
@@ -10152,7 +11330,7 @@ async function main() {
           throw new Error('current thread not found');
         }
         const history = currentThread.history || [];
-        const forceExecution = shouldDelegateToCodexInLocalModel(historyUserText || userText);
+        const forceExecution = shouldDelegateToCodexInLocalModel(historyUserText || userText) || Boolean(agentGatewayRoute.requiresExecution);
         console.log(`local_model_force_codex=${forceExecution ? 'true' : 'false'}`);
         if (forceExecution) {
           const codexThreadTitle = buildCodexThreadTitle({
@@ -10171,6 +11349,7 @@ async function main() {
             forceExecution: true,
             memoryBundleText,
             thingsCommandHint,
+            agentGatewayHint,
             throwIfCancelled: () => taskControl.throwIfCancelled(),
             onSpawn: (child) => {
               taskControl.attachCodexChild(child);
@@ -10189,6 +11368,7 @@ async function main() {
           });
           taskControl.throwIfCancelled();
           replyText = codexReply.reply;
+          effectiveCodexModelStatus = codexReply.modelStatus || buildCodexModelStatus(codex);
           if (codexReply.threadId) {
             currentThread.codexThreadId = codexReply.threadId;
             const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle, codex.home);
@@ -10224,6 +11404,7 @@ async function main() {
               forceExecution: true,
               memoryBundleText,
               thingsCommandHint,
+              agentGatewayHint,
               throwIfCancelled: () => taskControl.throwIfCancelled(),
               onSpawn: (child) => {
                 taskControl.attachCodexChild(child);
@@ -10242,6 +11423,7 @@ async function main() {
             });
             taskControl.throwIfCancelled();
             replyText = codexReply.reply;
+            effectiveCodexModelStatus = codexReply.modelStatus || buildCodexModelStatus(codex);
             if (codexReply.threadId) {
               currentThread.codexThreadId = codexReply.threadId;
               const synced = syncCodexThreadTitle(codexReply.threadId, codexThreadTitle, codex.home);
@@ -10267,6 +11449,7 @@ async function main() {
         }
         taskControl.throwIfCancelled();
         if (userReplyText) {
+          userReplyText = appendCurrentCodexStatus(userReplyText, effectiveCodexModelStatus);
           await sendCodexReplyPassthrough(client, chatID, userReplyText, () => !taskControl.isCancelled());
         }
         taskControl.throwIfCancelled();
@@ -10286,12 +11469,13 @@ async function main() {
         if (!userReplyText && attachmentSendResult.sent.length > 0) {
           userReplyText = buildDefaultAttachmentReply(attachmentSendResult.sent);
           if (userReplyText) {
+            userReplyText = appendCurrentCodexStatus(userReplyText, effectiveCodexModelStatus);
             await sendCodexReplyPassthrough(client, chatID, userReplyText, () => !taskControl.isCancelled());
           }
         }
         const attachmentFailureReply = buildAttachmentSendFailureReply(attachmentSendResult.sent, attachmentSendResult.failed);
         if (attachmentFailureReply) {
-          await sendTextReplySafe(client, chatID, attachmentFailureReply, 'reply_attachment_notice');
+          await sendTextReplySafe(client, chatID, appendCurrentCodexStatus(attachmentFailureReply, effectiveCodexModelStatus), 'reply_attachment_notice');
         }
         const finalReplyForLog = [userReplyText, buildAttachmentSendResultText(attachmentSendResult.sent, attachmentSendResult.failed)]
           .filter(Boolean)
@@ -10308,9 +11492,9 @@ async function main() {
           throw new Error(`${replyMode} reply empty`);
         }
         if (fakeStream.enabled && !shouldRenderFeishuMarkdown(echoReply)) {
-          await sendTextReplyWithFakeStream(client, chatID, echoReply, fakeStream);
+          await sendTextReplyWithFakeStream(client, chatID, appendCurrentCodexStatus(echoReply, effectiveCodexModelStatus), fakeStream);
         } else {
-          await sendRenderedReply(client, chatID, echoReply, {
+          await sendRenderedReply(client, chatID, appendCurrentCodexStatus(echoReply, effectiveCodexModelStatus), {
             logTag: 'reply',
             preferMarkdown: true,
           });
@@ -10349,6 +11533,13 @@ async function main() {
       }
 
       const activeThread = getCurrentThread(chatState);
+      recordChat({
+        direction: 'out',
+        event: 'reply',
+        mode: replyMode,
+        thread_id: activeThread ? activeThread.id : '',
+        text: compactText(String(replyText || codexRawReply || ''), 12000),
+      });
       console.log(`reply=ok mode=${replyMode} thread=${activeThread ? activeThread.id : ''}`);
     } catch (err) {
       if (taskControl.isCancelled() || isTaskCancelledError(err)) {
@@ -10358,21 +11549,35 @@ async function main() {
           currentThread.updatedAt = Date.now();
         }
         console.log(`reply=cancelled mode=${replyMode} reason=${taskControl.cancelReason || err.reason || err.message}`);
+        recordChat({
+          direction: 'system',
+          event: 'cancelled',
+          mode: replyMode,
+          reason: taskControl.cancelReason || err.reason || err.message,
+        });
         return;
       }
       const userVisibleError = replyMode === 'codex'
         ? String(err?.userVisibleSummary || summarizeCodexExecFailure(err, codex))
         : `处理失败：${compactText(String(err.message || '未知错误'), 1000)}`;
+      const errorReply = appendCurrentCodexStatus(userVisibleError, effectiveCodexModelStatus);
       console.error(`reply=error mode=${replyMode} message=${err.message}`);
       if (progressReporter) {
-        await progressReporter.fail(userVisibleError);
+        await progressReporter.fail(errorReply);
       }
       await sendTextReplySafe(
         client,
         chatID,
-        userVisibleError,
+        errorReply,
         'reply_error_notice'
       );
+      recordChat({
+        direction: 'out',
+        event: 'error',
+        mode: replyMode,
+        error: compactText(String(err.message || ''), 2000),
+        text: compactText(errorReply, 4000),
+      });
     } finally {
       releaseBusyTargets();
       if (typingState) {
@@ -10486,6 +11691,8 @@ async function main() {
   console.log(`bot_name=${botName || '(none)'}`);
   console.log(`require_mention=${mentionConfig.requireMention ? 'true' : 'false'}`);
   console.log(`require_mention_group_only=${mentionConfig.groupOnly ? 'true' : 'false'}`);
+  console.log(`bot_open_id_found=${creds.botOpenId.value ? 'true' : 'false'}`);
+  if (creds.botOpenId.source) console.log(`bot_open_id_source=${creds.botOpenId.source}`);
   console.log(`bot_open_id_autodetect=${mentionConfig.requireMention ? 'enabled' : 'not_needed'}`);
   console.log(`mention_aliases=${mentionAliases.length > 0 ? mentionAliases.join(' | ') : '(none)'}`);
   console.log(`reply_mode=${replyMode}`);
@@ -10493,6 +11700,17 @@ async function main() {
   console.log(`workspace_incoming_dir=${workspace.incomingDir}`);
   console.log(`workspace_output_dir=${workspace.outputDir}`);
   console.log(`workspace_temp_dir=${workspace.tempDir}`);
+  console.log(`chat_records_dir=${resolveChatRecordPath({ botName, accountName, date: new Date() })}`);
+  console.log(`agent_gateway_enabled=${agentGateway.enabled ? 'true' : 'false'}`);
+  console.log(`agent_gateway_mode=${agentGateway.mode}`);
+  console.log(`agent_gateway_chatlog_first=${agentGateway.chatlogFirst ? 'true' : 'false'}`);
+  console.log(`agent_gateway_normal_chat_executor=${agentGateway.normalChatExecutor}`);
+  console.log(`agent_gateway_coding_executor=${agentGateway.codingExecutor}`);
+  console.log(`agent_gateway_store_ops=${agentGateway.storeOps.enabled ? 'true' : 'false'}`);
+  console.log(`agent_gateway_store_ops_prefer_mcp=${agentGateway.storeOps.preferMcp ? 'true' : 'false'}`);
+  console.log(`agent_gateway_store_ops_require_mcp_first=${agentGateway.storeOps.requireMcpFirst ? 'true' : 'false'}`);
+  console.log(`agent_gateway_store_ops_mcp=${agentGateway.storeOps.mcpName}`);
+  console.log(`agent_gateway_dashboard=${agentGateway.dashboard.enabled ? `${agentGateway.dashboard.host}:${agentGateway.dashboard.port}` : '(disabled)'}`);
   console.log(`typing_indicator=${typing.enabled ? 'true' : 'false'}`);
   console.log(`fake_stream=${fakeStream.enabled ? 'true' : 'false'}`);
   const startupPersonalProxyOwner = personalProxy.enabled ? readPersonalProxyOwner(accountName) : {};
@@ -10517,6 +11735,9 @@ async function main() {
     console.log(`codex_bin=${codex.bin}`);
     console.log(`codex_model=${codex.model || '(default)'}`);
     console.log(`codex_reasoning_effort=${codex.reasoningEffort || '(default)'}`);
+    console.log(`codex_service_tier=${codex.serviceTier || '(default)'}`);
+    console.log(`codex_status_footer=${codex.statusFooterEnabled ? 'true' : 'false'}`);
+    console.log(`codex_model_override=${codexModelOverride.exists ? codexModelOverridePath(accountName) : '(none)'}`);
     printCodexModelRouteConfig(codex);
     console.log(`codex_profile=${codex.profile || '(default)'}`);
     console.log(`codex_home=${codex.home || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')}`);
@@ -10534,11 +11755,14 @@ async function main() {
   console.log(`memory_role_memory_chars=${memory.roleMemory.length}`);
   if (memory.enabled) console.log(`memory_store=${botMemoryStorePath(accountName)}`);
   console.log(`speech_enabled=${speech.enabled ? 'true' : 'false'}`);
+  console.log(`speech_provider=${speech.provider}`);
   console.log(`speech_model=${speech.model}`);
   console.log(`speech_language=${speech.language || '(auto)'}`);
   console.log(`speech_base_url=${speech.baseURL}`);
+  console.log(`speech_transcription_url=${speech.transcriptionURL || '(none)'}`);
   console.log(`speech_api_key_found=${speech.apiKey ? 'true' : 'false'}`);
   if (speech.apiKeySource) console.log(`speech_api_key_source=${speech.apiKeySource}`);
+  console.log(`speech_auth_token_found=${speech.authToken ? 'true' : 'false'}`);
   console.log(`speech_ffmpeg_bin=${speech.ffmpegBin || '(not found)'}`);
   if (speech.ffmpegVersion) console.log(`speech_ffmpeg_version=${speech.ffmpegVersion}`);
 }
@@ -10549,6 +11773,9 @@ module.exports = {
     FEISHU_ATTACHMENT_TEXT_CARRY_WINDOW_MS,
     buildAttachmentBundle,
     hasAttachmentBundleContent,
+    resolveSpeechConfig,
+    extractSpeechTranscriptionText,
+    isTodooRemoteSpeechProvider,
     parseCrossChatCommand,
     listRecentChatTargetsFromLogLines,
     resolveCrossChatTarget,
@@ -10567,6 +11794,9 @@ module.exports = {
     extractAttachmentBundleFromMessageItem,
     extractMessageItemTimestamp,
     mergeAttachmentBundles,
+    buildAudioResourceTypeCandidates,
+    extractBotInfoFromResponse,
+    resolveFeishuApiBaseUrl,
     findRecentAttachmentBundleFromMessageItems,
     buildRecentChatContextFromMessageItems,
     selectAttachmentSource,
@@ -10577,10 +11807,15 @@ module.exports = {
     pruneRecentTextCarryState,
     rememberRecentAttachmentCarry,
     getRecentAttachmentCarry,
+    resolveLiveRecentAttachmentBundle,
     consumeRecentAttachmentCarry,
     pruneRecentAttachmentCarryState,
+    normalizeFeishuResourceDownloadError,
     resolvePersonalProxyConfig,
     parsePersonalProxyCommand,
+    parseCodexModelCommand,
+    buildCodexModelStatus,
+    appendCodexModelStatusFooter,
     classifyPersonalProxySensitivity,
     personalProxyOwnerMatches,
     personalProxyGrantKey,
@@ -10590,8 +11825,27 @@ module.exports = {
     resolveProgressConfig,
     parseCodexPlainExecOutput,
     extractCodexErrorSummary,
+    extractCodexAgentMessage,
+    extractCodexAgentMessageText,
+    formatLocalDateFolder,
+    safeChatRecordPathSegment,
+    resolveChatRecordPath,
+    resolveAgentGatewayConfig,
+    classifyAgentGatewayRequest,
+    buildAgentGatewayCodexHint,
+    summarizeAgentGatewayRoute,
     isCodexAuthenticationErrorText,
+    isCodexObservableWorkEvent,
+    isNonSubstantiveCodexExecutionResult,
+    isTrivialCodexExecutionReply,
+    normalizeFeishuDisplayText,
+    shouldRenderFeishuMarkdown,
+    mergeCodexExecutionGuardrailPrompt,
+    shouldForceCodexExecution,
+    buildCodexExecLockScope,
+    resolveCodexExecLockDir,
     shouldRetryCodexExecError,
+    isMissingSpeechApiKeyError,
   },
 };
 

@@ -393,6 +393,14 @@ start_one() {
   append_export_if_set env_exports ZEROCHAT_API_KEY
   append_export_if_set env_exports OPENAI_API_KEY
   append_export_if_set env_exports CODEX_API_KEY
+  append_export_if_set env_exports FEISHU_SPEECH_PROVIDER
+  append_export_if_set env_exports FEISHU_SPEECH_API_KEY
+  append_export_if_set env_exports FEISHU_SPEECH_TRANSCRIPTION_URL
+  append_export_if_set env_exports FEISHU_SPEECH_AUTH_HEADER
+  append_export_if_set env_exports FEISHU_SPEECH_AUTH_TOKEN
+  append_export_if_set env_exports FEISHU_SPEECH_BASE_URL
+  append_export_if_set env_exports FEISHU_SPEECH_MODEL
+  append_export_if_set env_exports FEISHU_SPEECH_LANGUAGE
   append_export_if_set env_exports FEISHU_CODEX_BIN
   append_export_if_set env_exports NODE_TLS_REJECT_UNAUTHORIZED
 

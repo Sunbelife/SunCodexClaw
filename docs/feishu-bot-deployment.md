@@ -21,7 +21,7 @@
 安装全部飞书机器人：
 
 ```bash
-cd /Users/sunbelife/Code/SunCodexClaw
+cd /path/to/SunCodexClaw
 
 NODE_BIN=/usr/local/bin/node \
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex \
@@ -32,7 +32,7 @@ bash tools/install_feishu_launchagents.sh install all
 只安装单个账号：
 
 ```bash
-cd /Users/sunbelife/Code/SunCodexClaw
+cd /path/to/SunCodexClaw
 
 NODE_BIN=/usr/local/bin/node \
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex \
@@ -107,7 +107,7 @@ bash tools/feishu_bot_ctl.sh logs fei-cxp --follow
 重装命令：
 
 ```bash
-cd /Users/sunbelife/Code/SunCodexClaw
+cd /path/to/SunCodexClaw
 
 NODE_BIN=/usr/local/bin/node \
 CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex \

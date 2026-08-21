@@ -10,8 +10,9 @@
   "unsupported_media_reply": "当前接入版先支持文本消息，图片和文件能力我还没在这个微信通道里接完。",
   "codex": {
     "bin": "codex",
-    "model": "gpt-5.4",
-    "reasoning_effort": "high",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "xhigh",
+    "service_tier": "default",
     "profile": "",
     "cwd": "/absolute/path/to/workspace",
     "add_dirs": [],

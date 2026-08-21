@@ -448,8 +448,9 @@ function resolveCodexConfig(config = {}) {
   const selectedApiKey = selectCodexApiKey(cliLikeCodex);
   return {
     bin: normalizeString(codex.bin || 'codex') || 'codex',
-    model: normalizeString(codex.model),
-    reasoningEffort: normalizeString(codex.reasoning_effort),
+    model: normalizeString(codex.model || 'gpt-5.6-sol'),
+    reasoningEffort: normalizeString(codex.reasoning_effort || 'xhigh'),
+    serviceTier: normalizeString(codex.service_tier || codex.serviceTier || 'default'),
     profile: normalizeString(codex.profile),
     home,
     cwd,
@@ -476,6 +477,7 @@ function buildCodexPrompt({
   cwd = '',
   addDirs = [],
   threadTitle = '',
+  agentGatewayHint = '',
 }) {
   const lines = [];
   const title = normalizeString(threadTitle);
@@ -491,6 +493,11 @@ function buildCodexPrompt({
     for (const dir of addDirs) {
       lines.push(`- ${dir}`);
     }
+  }
+  const routeHint = normalizeString(agentGatewayHint);
+  if (routeHint) {
+    lines.push('');
+    lines.push(routeHint);
   }
   lines.push('');
   lines.push('对话上下文（按时间顺序，可能为空）：');
@@ -511,16 +518,24 @@ function buildCodexPrompt({
   return lines.join('\n');
 }
 
-function buildCodexResumePrompt({ userText = '' }) {
-  return [
+function buildCodexResumePrompt({ userText = '', agentGatewayHint = '' }) {
+  const lines = [
     '继续当前线程。下面是用户最新消息，请直接回复用户。',
     '',
+  ];
+  const routeHint = normalizeString(agentGatewayHint);
+  if (routeHint) {
+    lines.push(routeHint);
+    lines.push('');
+  }
+  lines.push(
     '用户最新消息：',
     compactText(userText, 2400),
     '',
     '请直接输出给用户的最终回复正文，不要加“好的/收到”等空话，不要复述用户原话。',
-    '禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。',
-  ].join('\n');
+    '禁止输出“稍后回复/几分钟后回复/晚点再回复”这类承诺。无法完成就直接说明卡点和下一步。'
+  );
+  return lines.join('\n');
 }
 
 function shouldBypassCodexSandbox(sandbox, approvalPolicy) {
@@ -532,6 +547,7 @@ function runCodexExec({
   bin,
   model,
   reasoningEffort,
+  serviceTier,
   profile,
   home,
   cwd,
@@ -541,6 +557,7 @@ function runCodexExec({
   apiKey = '',
   prompt,
   resumeSessionId = '',
+  onProgressEvent = null,
 }) {
   return new Promise((resolve, reject) => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-codex-'));
@@ -554,6 +571,7 @@ function runCodexExec({
     if (bypassSandbox) args.push('--dangerously-bypass-approvals-and-sandbox');
     if (model) args.push('-m', model);
     if (reasoningEffort) args.push('-c', `model_reasoning_effort=\"${reasoningEffort}\"`);
+    if (serviceTier) args.push('-c', `service_tier=\"${serviceTier}\"`);
     if (!resumeId && profile) args.push('-p', profile);
     if (!resumeId && cwd) args.push('-C', cwd);
     if (!resumeId) {
@@ -587,6 +605,15 @@ function runCodexExec({
     let jsonBuffer = '';
     let observedThreadId = resumeId;
 
+    function emitProgressEvent(event) {
+      if (typeof onProgressEvent !== 'function') return;
+      try {
+        onProgressEvent(event);
+      } catch (_) {
+        // Progress callbacks are best-effort and must not break execution.
+      }
+    }
+
     child.stdout.on('data', (buf) => {
       const chunk = String(buf || '');
       stdout = `${stdout}${chunk}`;
@@ -603,8 +630,9 @@ function runCodexExec({
             if (parsed?.type === 'thread.started' && parsed?.thread_id) {
               observedThreadId = normalizeString(parsed.thread_id) || observedThreadId;
             }
+            emitProgressEvent(parsed);
           } catch (_) {
-            // ignore non-json lines
+            emitProgressEvent({ type: 'raw', text: line });
           }
         }
         idx = jsonBuffer.indexOf('\n');
@@ -654,14 +682,17 @@ async function generateCodexReply({
   userText = '',
   sessionId = '',
   threadTitle = '',
+  agentGatewayHint = '',
+  onProgressEvent = null,
 }) {
   const resumeId = normalizeString(sessionId);
   if (resumeId) {
     try {
       const resumed = await runCodexExec({
         ...codex,
-        prompt: buildCodexResumePrompt({ userText }),
+        prompt: buildCodexResumePrompt({ userText, agentGatewayHint }),
         resumeSessionId: resumeId,
+        onProgressEvent,
       });
       return {
         reply: normalizeString(resumed.reply) ? String(resumed.reply) : '',
@@ -681,7 +712,9 @@ async function generateCodexReply({
       cwd: codex.cwd,
       addDirs: codex.addDirs,
       threadTitle,
+      agentGatewayHint,
     }),
+    onProgressEvent,
   });
   return {
     reply: normalizeString(fresh.reply) ? String(fresh.reply) : '',

@@ -249,8 +249,10 @@ config:
       codex:
         bin: "codex"
         api_key: "sk-..."
-        model: "gpt-5.4"
+        model: "gpt-5.6-sol"
         reasoning_effort: "xhigh"
+        service_tier: "default"
+        status_footer: true
         profile: ""
         cwd: "/absolute/path/to/workspace"
         add_dirs:
@@ -270,6 +272,21 @@ config:
         role_memory: |
           默认用简体中文回复。
           默认先做事，再解释。
+      agent_gateway:
+        enabled: true
+        mode: "codex_first"
+        chatlog_first: true
+        normal_chat_executor: "codex_cli"
+        coding_executor: "codex"
+        store_ops:
+          enabled: true
+          prefer_mcp: true
+          require_mcp_first: true
+          mcp_name: "店铺 MCP"
+        dashboard:
+          enabled: true
+          host: "127.0.0.1"
+          port: 8731
 ```
 
 `config/feishu/<account>.json` 示例：
@@ -297,6 +314,13 @@ config:
   "memory": {
     "enabled": true,
     "role_memory": "默认简洁、直接、少空话。"
+  },
+  "agent_gateway": {
+    "enabled": true,
+    "store_ops": {
+      "prefer_mcp": true,
+      "require_mcp_first": true
+    }
   }
 }
 ```
@@ -309,6 +333,23 @@ config:
 - `memory.role_memory` 适合写“这个机器人应该长期遵守的角色偏好”
 - `bot_open_id` 可以不手填，第一次成功 `@` 后会自动探测并持久化
 - 如果你已经通过 `codex login` 登录，也可以不填 `codex.api_key`
+- `agent_gateway.store_ops.require_mcp_first=true` 会把店铺/订单/客户/库存等操作路由成 MCP 优先，减少 Codex 随机绕路
+
+## Agent Gateway 后台
+
+本地打开网页后台：
+
+```bash
+npm run agent:dashboard
+```
+
+只做探针检查：
+
+```bash
+npm run agent:dashboard:probe
+```
+
+后台默认监听 `127.0.0.1:8731`，会读取飞书机器人状态、运行日志、`Chatlog/`、记忆文件、隐私审批队列和已配置 MCP。选中机器人后，也可以在“后台对话”里直接和它聊天；这会复用该机器人的 Codex 配置和 Agent Gateway 规则，默认只回到网页后台，不刷飞书。
 
 ## 快速验证
 
@@ -391,7 +432,7 @@ macOS 下推荐只使用持久 `LaunchAgent`，不要再依赖临时 `launchctl 
 
 ```bash
 NODE_BIN=/usr/local/bin/node \
-CODEX_BIN=/Applications/Codex.app/Contents/Resources/codex \
+CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex \
 NODE_TLS_REJECT_UNAUTHORIZED=0 \
 bash tools/install_feishu_launchagents.sh install all
 ```
@@ -444,6 +485,7 @@ com.sunbelife.suncodexclaw.feishu
 - 支持直接接收飞书语音消息
 - 会先下载语音，再转写成文字交给 Codex
 - 默认可复用 `codex.api_key` 做转写，也可以单独配置 `speech.api_key`
+- 也可以配置 `speech.provider: "todoo_remote"` 和 `speech.transcription_url`，接入兼容的远程语音转写服务
 
 ### 文件读取
 

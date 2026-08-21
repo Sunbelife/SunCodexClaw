@@ -29,14 +29,17 @@
     "api_key": "",
     "model": "",
     "reasoning_effort": "",
+    "service_tier": "",
+    "status_footer": true,
     "profile": "",
     "cwd": "",
     "add_dirs": [],
     "model_routes": {
       "writing_request": {
         "enabled": false,
-        "model": "gpt-5.4",
+        "model": "gpt-5.6-sol",
         "reasoning_effort": "xhigh",
+        "service_tier": "default",
         "trigger_keywords": [
           "写公众号文章",
           "公众号文章",
@@ -50,8 +53,9 @@
       },
       "non_coding_request": {
         "enabled": false,
-        "model": "gpt-5.4",
+        "model": "gpt-5.6-sol",
         "reasoning_effort": "xhigh",
+        "service_tier": "default",
         "trigger_keywords": [
           "不用Codex",
           "不要Codex",
@@ -66,6 +70,8 @@
   },
   "speech": {
     "enabled": true,
+    "provider": "openai",
+    "transcription_url": "",
     "api_key": "",
     "model": "gpt-4o-mini-transcribe",
     "language": "",
@@ -75,6 +81,41 @@
   "memory": {
     "enabled": true,
     "role_memory": ""
+  },
+  "agent_gateway": {
+    "enabled": true,
+    "mode": "codex_first",
+    "chatlog_first": true,
+    "normal_chat_executor": "codex_cli",
+    "coding_executor": "codex",
+    "store_ops": {
+      "enabled": true,
+      "prefer_mcp": true,
+      "require_mcp_first": true,
+      "mcp_name": "店铺 MCP",
+      "context_keywords": [
+        "店铺",
+        "订单",
+        "客户",
+        "商品",
+        "库存",
+        "后台"
+      ],
+      "action_keywords": [
+        "查",
+        "看",
+        "统计",
+        "导出",
+        "处理",
+        "修改",
+        "同步"
+      ]
+    },
+    "dashboard": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8731
+    }
   },
   "outbound_channels": {
     "wecom": {

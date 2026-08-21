@@ -15,6 +15,8 @@
     "feishu:status": "bash tools/feishu_bot_ctl.sh status all",
     "feishu:install-launchagents": "bash tools/install_feishu_launchagents.sh install all",
     "feishu:launchagents:status": "bash tools/install_feishu_launchagents.sh status all",
+    "agent:dashboard": "node tools/agent_gateway_dashboard.js --open",
+    "agent:dashboard:probe": "node tools/agent_gateway_dashboard.js --probe",
     "weixin:login": "node tools/weixin_openclaw_bot.js --account default --login",
     "weixin:run": "node tools/weixin_openclaw_bot.js --account default",
     "weixin:run:once": "node tools/weixin_openclaw_bot.js --account default --once",

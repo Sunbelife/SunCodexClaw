@@ -1382,6 +1382,7 @@ function createScheduledJobManager({
       bin: codex.bin,
       model: codex.model,
       reasoningEffort: codex.reasoningEffort,
+      serviceTier: codex.serviceTier,
       profile: codex.profile,
       cwd: normalizeString(taskLike.cwd) || codex.cwd,
       addDirs: codex.addDirs || [],
