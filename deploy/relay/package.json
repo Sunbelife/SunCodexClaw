@@ -1,0 +1,8 @@
+{
+  "name": "suncodexclaw-relay-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ws": "8.19.0"
+  }
+}

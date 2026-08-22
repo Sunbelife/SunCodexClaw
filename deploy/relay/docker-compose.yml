@@ -1,0 +1,18 @@
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: deploy/relay/Dockerfile
+    restart: unless-stopped
+    environment:
+      SCC_RELAY_HOST: 0.0.0.0
+      SCC_RELAY_PORT: 8782
+      SCC_RELAY_REGISTRY: /data/registry.json
+      SCC_RELAY_REGISTRATION_KEY: ${SCC_RELAY_REGISTRATION_KEY:?set SCC_RELAY_REGISTRATION_KEY}
+    volumes:
+      - relay-data:/data
+    ports:
+      - "127.0.0.1:8782:8782"
+
+volumes:
+  relay-data:

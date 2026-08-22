@@ -1,9 +1,17 @@
 {
   "name": "suncodexclaw",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Feishu Codex assistant with WebSocket bot runtime, image and voice ingestion, cloud-doc progress logs, and local attachment sending.",
   "private": true,
   "type": "commonjs",
+  "bin": {
+    "scc": "tools/scc_cli.js",
+    "scc-host": "tools/remote_gateway.js",
+    "scc-relay": "tools/remote_relay.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
   "scripts": {
     "feishu:ws": "node tools/feishu_ws_bot.js --account default",
     "feishu:ws:dry": "node tools/feishu_ws_bot.js --account default --dry-run",
@@ -17,6 +25,18 @@
     "feishu:launchagents:status": "bash tools/install_feishu_launchagents.sh status all",
     "agent:dashboard": "node tools/agent_gateway_dashboard.js --open",
     "agent:dashboard:probe": "node tools/agent_gateway_dashboard.js --probe",
+    "remote:setup": "node tools/remote_gateway.js setup",
+    "remote:start": "node tools/remote_gateway.js start",
+    "remote:status": "node tools/remote_gateway.js status",
+    "remote:pair": "node tools/remote_gateway.js pair",
+    "remote:token:list": "node tools/remote_gateway.js token-list",
+    "remote:token:revoke": "node tools/remote_gateway.js token-revoke",
+    "remote:cli:pack": "node tools/build_remote_cli_package.js",
+    "remote:install": "bash tools/install_remote_gateway_launchagent.sh install",
+    "remote:uninstall": "bash tools/install_remote_gateway_launchagent.sh uninstall",
+    "remote:logs": "bash tools/install_remote_gateway_launchagent.sh logs",
+    "relay:start": "node tools/remote_relay.js start",
+    "test": "node --test test/*.test.js",
     "weixin:login": "node tools/weixin_openclaw_bot.js --account default --login",
     "weixin:run": "node tools/weixin_openclaw_bot.js --account default",
     "weixin:run:once": "node tools/weixin_openclaw_bot.js --account default --once",
@@ -24,7 +44,10 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",
-    "ffmpeg-static": "^5.3.0",
-    "yaml": "^2.8.2"
+    "yaml": "^2.8.2",
+    "ws": "^8.19.0"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.3.0"
   }
 }

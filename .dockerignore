@@ -1,0 +1,10 @@
+.git
+.runtime
+Chatlog
+node_modules
+apps
+test
+config/secrets
+config/feishu/*.json
+config/weixin_openclaw/*.json
+*.log

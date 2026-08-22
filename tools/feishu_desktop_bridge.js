@@ -191,6 +191,7 @@ function normalizeThreadRecord(thread) {
   return {
     id: sanitizeThreadId(value.id) || `studio-${Date.now()}`,
     name: normalizeString(value.name) || '新线程',
+    source: normalizeString(value.source || 'studio') || 'studio',
     chatId: normalizeString(value.chat_id || value.chatId),
     chatType: normalizeString(value.chat_type || value.chatType || 'p2p') || 'p2p',
     chatLabel: normalizeString(value.chat_label || value.chatLabel) || '',
@@ -989,14 +990,17 @@ function handleThreadCreate(account) {
   if (!normalizeString(account)) fail('account is required');
   const payload = ensurePlainObject(readPayload());
   const chatId = normalizeString(payload.chat_id || payload.chatId);
-  if (!chatId) fail('chat_id is required');
+  const source = normalizeString(payload.source || 'studio') || 'studio';
+  const localOnlySource = ['cli', 'remote_cli', 'dashboard', 'local'].includes(source.toLowerCase());
+  if (!chatId && !localOnlySource) fail('chat_id is required');
 
   const name = normalizeString(payload.name) || '新线程';
   const nextThread = normalizeThreadRecord({
     id: `studio-${Date.now().toString(36)}`,
     name,
+    source,
     chat_id: chatId,
-    chat_type: normalizeString(payload.chat_type || payload.chatType || 'p2p') || 'p2p',
+    chat_type: normalizeString(payload.chat_type || payload.chatType || (localOnlySource ? 'local' : 'p2p')) || 'p2p',
     chat_label: normalizeString(payload.chat_label || payload.chatLabel),
     status: 'idle',
     history: [],
@@ -1028,7 +1032,7 @@ async function handleThreadSend(account) {
   const threadId = sanitizeThreadId(payload.thread_id || payload.threadId);
   const text = normalizeString(payload.text);
   const deliveryMode = normalizeString(payload.deliver || payload.delivery || payload.deliveryMode || 'feishu').toLowerCase();
-  const shouldDeliverToFeishu = !['dashboard', 'local', 'none', 'return_only', 'return-only'].includes(deliveryMode);
+  const shouldDeliverToFeishu = !['dashboard', 'cli', 'remote_cli', 'local', 'none', 'return_only', 'return-only'].includes(deliveryMode);
   if (!threadId) fail('thread_id is required');
   if (!text) fail('text is required');
 

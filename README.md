@@ -171,6 +171,44 @@ cd SunCodexClaw
 npm install
 ```
 
+## 从另一台电脑连接机器人
+
+仓库现在包含 Remote Gateway 和 `scc` CLI，可以从另一台电脑列出本机全部机器人、创建独立会话并直接对话，也可以在同一个 CLI 里保存多台机器人电脑。
+
+默认使用类似 CC Pocket 的消息中继：机器人电脑只主动外拨连接公网 Relay，不需要公网 IP、端口映射、同一局域网或 Tailscale。Relay 只转发端到端加密的消息帧。
+
+部署 Relay 后，在机器人电脑首次运行：
+
+```bash
+npm run remote:setup -- \
+  --relay wss://relay.example.com \
+  --registration-key 'Relay机器注册密钥' \
+  --machine-name "我的机器人电脑" \
+  --name "第一台远程电脑"
+npm run remote:install
+```
+
+然后在另一台电脑进入仓库，一行完成拉取、安装 CLI 和绑定；把最后的占位符换成上一步输出的 `scc2_...` token：
+
+```bash
+git pull origin sun && npm install -g --omit=optional . && scc machine add home 'scc2_这里粘贴Token'
+```
+
+如果另一台电脑还没有仓库，则一行首次安装：
+
+```bash
+git clone -b sun https://github.com/Sunbelife/SunCodexClaw.git && cd SunCodexClaw && npm install -g --omit=optional . && scc machine add home 'scc2_这里粘贴Token'
+```
+
+安装并绑定后即可使用：
+
+```bash
+scc -m home bot list
+scc -m home chat assistant
+```
+
+完整安装、配对、多电脑管理、token 撤销和安全说明见：[远程 CLI 文档](docs/remote-cli.md)。
+
 ## 先决条件
 
 在使用前，你需要先有：
